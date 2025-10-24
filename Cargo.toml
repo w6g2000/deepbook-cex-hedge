@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/app",
+    "crates/shared",
+    "crates/cex-watcher",
+    "crates/cex-execution",
+    "crates/deepbook-watcher",
+    "crates/deepbook-execution",
+    "crates/execution",
+    "crates/lending",
+    "crates/strategy",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+url = "2"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+toml = "0.8"
+thiserror = "2"
+sui_sdk = { git = "https://github.com/mystenlabs/sui", package = "sui-sdk"}
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "09f86974195ec85d8aae386b1909d341d3ccfe52" }
+sui-types = { git = "https://github.com/mystenlabs/sui", package = "sui-types" }
+sui-deepbookv3 = { git = "https://github.com/w6g2000/sui-deepbookv3.git" }
+sui-keys = { git = "https://github.com/mystenlabs/sui", package = "sui-keys" }
+shared-crypto = { git = "https://github.com/mystenlabs/sui", package = "shared-crypto" }
+binance-sdk = { version = "25.0.0", default-features = false, features = ["spot"] }
+rust_decimal = "1.37"
+dotenvy = "0.15"
+openssl = { version = "0.10", features = ["vendored"] }

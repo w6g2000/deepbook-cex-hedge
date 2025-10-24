@@ -1,0 +1,23 @@
+[package]
+name = "deepbook-execution"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+shared = { path = "../shared" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bcs = "0.1"
+hex = "0.4"
+sui_sdk = { workspace = true }
+base64 = "0.21"
+fastcrypto = { workspace = true }
+sui-types = { workspace = true }
+sui-deepbookv3 = { workspace = true }
+sui-keys = { workspace = true }
+shared-crypto = { workspace = true }
+dotenvy = "0.15"

@@ -1,0 +1,65 @@
+# 默认配置示例，请根据实际部署环境填写
+
+[[pairs]]
+# 交易对配置：base = 标的币种，quote = 抵押币种
+base = "WAL"
+quote = "USDC"
+
+[arbitrage]
+# 最小可接受价差（基点）。达到该价差才挂单。
+min_spread_bps = 10.0
+# 最大允许持仓数量（基础资产数量）。
+max_position = 1_000.0
+
+[deepbook]
+# Deepbook 指标接口，轮询订单簿使用的 HTTP Endpoint。
+endpoint = "https://deepbook-indexer.mainnet.mystenlabs.com/orderbook"
+# 指标接口 level 参数（深度等级，通常 1/2/3）。
+level = 2
+# 指标接口 depth 参数（返回多少档）。
+depth = 30
+# 轮询频率（毫秒），减小可更快更新但更耗资源。
+poll_interval_ms = 1000
+# DeepBook 链上下单所需的私钥环境变量名（请在 .env 中设置 DEEPBOOK_PRIVATE_KEY）。
+signer_env = "DEEPBOOK_PRIVATE_KEY"
+
+[cex]
+# 币安 REST 深度接口，用于初始化 orderbook。
+rest_base = "https://api.binance.com/api/v3/depth"
+# 币安 WebSocket Combined stream 前缀（后面拼接交易对@depth）。
+stream_base = "wss://stream.binance.com:9443/stream?streams="
+# API Key / Secret 对应的环境变量名称（请在 .env 中填写实际密钥）。
+api_key_env = "BINANCE_API_KEY"
+api_secret_env = "BINANCE_API_SECRET"
+# 是否使用测试网（默认 false，若要连接 testnet 请改为 true）。
+use_testnet = false
+# REST 调用使用的 recvWindow（毫秒），可不填表示采用 Binance 默认值。
+# recv_window_ms = 5000
+
+[lending]
+# 质押币种（在 Navi 抵押的资产，例：USDC）。
+collateral_symbol = "USDC"
+# 借出的目标币种（在 Deepbook 挂单用的代币，例：WAL）。
+borrow_symbol = "WAL"
+# 借款上限占抵押物价值比例（例如 0.5 表示 50%）。
+max_borrow_ratio = 0.5
+# 当借款价值达到抵押物的该比例时触发还款（预警阈值）。
+repay_threshold_ratio = 0.6
+
+[strategy]
+# 单次最大挂单数量（基础资产数量）。
+max_order_size = 500.0
+# 深度要求：订单簿指定档位累计深度需 ≥ 该数值才触发。
+min_book_depth = 600.0
+# CEX 价格波动率报警阈值（bps），超过则暂停/撤单。
+cex_volatility_bps = 100.0
+# 当 CEX 价格变化小于该阈值时不重新挂单，避免频繁 gas。
+rebid_threshold_bps = 5.0
+
+[shutdown]
+# 程序退出时撤单超时时间（毫秒）。
+cancel_timeout_ms = 5000
+# 归还借款超时时间（毫秒）。
+repay_timeout_ms = 7000
+# 平掉 CEX 对冲仓位的超时时间（毫秒）。
+close_hedge_timeout_ms = 7000

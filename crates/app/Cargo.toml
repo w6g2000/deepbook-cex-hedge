@@ -1,0 +1,19 @@
+[package]
+name = "deepbook-cex-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+cex-execution = { path = "../cex-execution" }
+cex-watcher = { path = "../cex-watcher" }
+deepbook-watcher = { path = "../deepbook-watcher" }
+execution = { path = "../execution" }
+lending = { path = "../lending" }
+deepbook-execution = { path = "../deepbook-execution" }
+shared = { path = "../shared" }
+strategy = { path = "../strategy" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }

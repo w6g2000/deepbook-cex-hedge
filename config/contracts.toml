@@ -1,0 +1,46 @@
+# 链上合约地址配置
+
+navi_core = "0xNAVICORECONTRACTPLACEHOLDER"
+navi_market = "0xNAVIMARKETPLACEHOLDER"
+navi_price_oracle = "0xNAVIORACLEPLACEHOLDER"
+deepbook_pool = "0xDEEPBOOKPOOLPLACEHOLDER"
+
+[deepbook_execution]
+rpc_endpoint = "https://fullnode.mainnet.sui.io:443"
+package_id = "0x0517b8c5ca29fbb9f09cf77530ba331f30f59b6203d13d28796e76e362cc0e12"
+module = "deepbookv3_utils"
+function = "place_limit_order"
+base_type = "0x356a26eb9e012a68958082340d4c4116e7f55615cf27affcff209cf0ae544f59::wal::WAL"
+quote_type = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC"
+price_scale = 1_000_000
+quantity_scale = 1_000_000_000
+restriction = 0
+self_matching_prevention = 0
+post_only = true
+client_order_id_start = 1
+gas_budget = 50_000_000
+
+[[deepbook_execution.shared_objects]]
+object_id = "0xff1141ef80e7baf206c7930c274b465600e64884d8167f90d4cdb60197925163"
+initial_shared_version = 341697211
+mutable = true
+
+[[deepbook_execution.shared_objects]]
+object_id = "0x5c1a039f97ed1cbd84d54b5d633bdffd681086acc38961b1d366c4ecf680d150"
+initial_shared_version = 341697211
+mutable = true
+
+[[deepbook_execution.shared_objects]]
+object_id = "0x56a1c985c1f1123181d6b881714793689321ba24301b3585eec427436eb1c76d"
+initial_shared_version = 414947427
+mutable = true
+
+[[deepbook_execution.shared_objects]]
+object_id = "0xd721801d92d472e83d970de75865daf1698463021e6b24589585595549acd499"
+initial_shared_version = 663134436
+mutable = true
+
+[deepbook_execution.clock]
+object_id = "0x0000000000000000000000000000000000000000000000000000000000000006"
+initial_shared_version = 1
+mutable = false

@@ -1,0 +1,11 @@
+[package]
+name = "execution"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+cex-execution = { path = "../cex-execution" }
+shared = { path = "../shared" }
+tokio = { workspace = true }
+tracing = { workspace = true }

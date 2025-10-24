@@ -1,0 +1,11 @@
+[package]
+name = "lending"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+shared = { path = "../shared" }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = {workspace = true}
