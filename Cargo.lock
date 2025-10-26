@@ -3863,10 +3863,22 @@ name = "lending"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bcs",
+ "dotenvy",
+ "hex",
+ "move-core-types",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
  "shared",
+ "shared-crypto",
+ "sui-sdk",
+ "sui-types",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -6879,6 +6891,7 @@ name = "shared"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dotenvy",
  "serde",
  "serde_json",
  "tokio",
@@ -7213,6 +7226,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "cex-execution",
  "deepbook-execution",
  "lending",
  "shared",

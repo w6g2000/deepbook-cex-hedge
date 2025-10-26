@@ -63,3 +63,16 @@ cancel_timeout_ms = 5000
 repay_timeout_ms = 7000
 # 平掉 CEX 对冲仓位的超时时间（毫秒）。
 close_hedge_timeout_ms = 7000
+
+[rebalance]
+# 最小搬货名义金额（USDC 计价），建议在 .env 中设置 `REBALANCE_MIN_NOTIONAL_USD`。
+# min_notional_usd = 50.0
+# 搬货冷却时间（秒），默认读取环境变量 `REBALANCE_COOLDOWN_SECS`。
+# cooldown_secs = 60
+# Binance 提币目标地址、网络、Memo，可在 .env 中使用 `CEX_DEPOSIT_*` 覆盖。
+# deposit_address = ""
+# deposit_network = "SUI"
+# deposit_memo = ""
+# 借贷告警阈值与目标比例，可通过 `LENDING_BORROW_RATIO_ALERT`、`LENDING_BORROW_RATIO_TARGET` 配置。
+# borrow_alert_ratio = 0.6
+# borrow_target_ratio = 0.5

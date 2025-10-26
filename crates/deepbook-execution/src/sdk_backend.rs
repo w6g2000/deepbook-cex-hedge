@@ -1,13 +1,14 @@
 use crate::{
     ClaimSummary, DeepbookBackend, FillUpdate, OrderSnapshot, OrderStatus, PlaceOrderRequest,
+    PoolAccountSnapshot,
 };
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use dotenvy::dotenv;
 use shared_crypto::intent::{Intent, IntentMessage};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use sui_deepbookv3::client::{Account, DeepBookClient};
 use sui_deepbookv3::utils::config::{BalanceManagerMap, Environment as SdkEnvironment};
@@ -285,12 +286,7 @@ impl SdkBackend {
         let mut builder = ProgrammableTransactionBuilder::new();
         self.deepbook
             .deep_book
-            .cancel_order(
-                &mut builder,
-                pool_key,
-                &self.balance_manager_key,
-                order_id,
-            )
+            .cancel_order(&mut builder, pool_key, &self.balance_manager_key, order_id)
             .await
             .context("failed to build deepbook cancel order call")?;
         Ok(builder)
@@ -303,20 +299,13 @@ impl SdkBackend {
         let mut builder = ProgrammableTransactionBuilder::new();
         self.deepbook
             .deep_book
-            .cancel_all_orders(
-                &mut builder,
-                pool_key,
-                &self.balance_manager_key,
-            )
+            .cancel_all_orders(&mut builder, pool_key, &self.balance_manager_key)
             .await
             .context("failed to build deepbook cancel_all orders call")?;
         Ok(builder)
     }
 
-    async fn build_claim_rebates(
-        &self,
-        pool_key: &str,
-    ) -> Result<ProgrammableTransactionBuilder> {
+    async fn build_claim_rebates(&self, pool_key: &str) -> Result<ProgrammableTransactionBuilder> {
         let mut builder = ProgrammableTransactionBuilder::new();
         self.deepbook
             .deep_book
@@ -326,16 +315,25 @@ impl SdkBackend {
         Ok(builder)
     }
 
+    async fn build_withdraw_settled_amounts(
+        &self,
+        pool_key: &str,
+    ) -> Result<ProgrammableTransactionBuilder> {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        self.deepbook
+            .deep_book
+            .withdraw_settled_amounts(&mut builder, pool_key, &self.balance_manager_key)
+            .await
+            .context("failed to build deepbook withdraw settled amounts call")?;
+        Ok(builder)
+    }
+
     async fn fetch_order_snapshot(
         &self,
         pool_key: &str,
         order_id: u128,
     ) -> Result<Option<OrderSnapshot>> {
-        let normalized = match self
-            .deepbook
-            .get_order_normalized(pool_key, order_id)
-            .await
-        {
+        let normalized = match self.deepbook.get_order_normalized(pool_key, order_id).await {
             Ok(Some(order)) => order,
             Ok(None) => return Ok(None),
             Err(err) => {
@@ -397,12 +395,7 @@ impl SdkBackend {
         }))
     }
 
-    async fn register_order(
-        &self,
-        order_id: u128,
-        pool_key: String,
-        snapshot: OrderSnapshot,
-    ) {
+    async fn register_order(&self, order_id: u128, pool_key: String, snapshot: OrderSnapshot) {
         let mut index = self.order_index.lock().await;
         index.insert(
             order_id.to_string(),
@@ -527,14 +520,12 @@ impl DeepbookBackend for SdkBackend {
         let snapshot = self
             .fetch_order_snapshot(&request.pool_key, new_order_id)
             .await?
-            .ok_or_else(|| anyhow!("deepbook order {new_order_id} not retrievable after placement"))?;
+            .ok_or_else(|| {
+                anyhow!("deepbook order {new_order_id} not retrievable after placement")
+            })?;
 
-        self.register_order(
-            new_order_id,
-            request.pool_key.clone(),
-            snapshot.clone(),
-        )
-        .await;
+        self.register_order(new_order_id, request.pool_key.clone(), snapshot.clone())
+            .await;
 
         Ok(snapshot)
     }
@@ -640,10 +631,7 @@ impl DeepbookBackend for SdkBackend {
                     }
                 };
 
-                match self
-                    .fetch_order_snapshot(&pool_key, parsed_id)
-                    .await?
-                {
+                match self.fetch_order_snapshot(&pool_key, parsed_id).await? {
                     Some(snapshot) => {
                         self.cache_snapshot(&order_id, snapshot.clone()).await;
                         if snapshot.status == OrderStatus::Cancelled
@@ -714,6 +702,45 @@ impl DeepbookBackend for SdkBackend {
         Ok(ClaimSummary::from_map(claimed))
     }
 
+    async fn withdraw_settled(&self, pool_key: &str) -> Result<Option<crate::ClaimableBalance>> {
+        let account = self.fetch_account(pool_key).await?;
+        let base_settled = account.settled_balances.base;
+        let quote_settled = account.settled_balances.quote;
+
+        if base_settled <= f64::EPSILON && quote_settled <= f64::EPSILON {
+            return Ok(None);
+        }
+
+        let builder = self.build_withdraw_settled_amounts(pool_key).await?;
+        self.execute_transaction(builder).await?;
+
+        let pair = pool_key.replace('_', "/");
+        info!(
+            pool = %pool_key,
+            pair = %pair,
+            base_settled,
+            quote_settled,
+            "withdrew settled balances"
+        );
+
+        Ok(Some(crate::ClaimableBalance {
+            base_asset: base_settled,
+            quote_asset: quote_settled,
+        }))
+    }
+
+    async fn pool_account_snapshot(&self, pool_key: &str) -> Result<PoolAccountSnapshot> {
+        let account = self.fetch_account(pool_key).await?;
+        Ok(PoolAccountSnapshot {
+            settled_base: account.settled_balances.base,
+            settled_quote: account.settled_balances.quote,
+            owed_base: account.owed_balances.base,
+            owed_quote: account.owed_balances.quote,
+            unclaimed_base: account.unclaimed_rebates.base,
+            unclaimed_quote: account.unclaimed_rebates.quote,
+        })
+    }
+
     async fn get_order(&self, order_id: &str) -> Result<Option<OrderSnapshot>> {
         let metadata = {
             let index = self.order_index.lock().await;
@@ -729,10 +756,7 @@ impl DeepbookBackend for SdkBackend {
             .parse::<u128>()
             .context("order_id must be numeric for deepbook queries")?;
 
-        match self
-            .fetch_order_snapshot(&meta.pool_key, parsed_id)
-            .await?
-        {
+        match self.fetch_order_snapshot(&meta.pool_key, parsed_id).await? {
             Some(snapshot) => {
                 let terminal = snapshot.status == OrderStatus::Filled
                     || snapshot.status == OrderStatus::Cancelled
@@ -775,10 +799,7 @@ impl DeepbookBackend for SdkBackend {
                     continue;
                 }
             };
-            match self
-                .fetch_order_snapshot(&meta.pool_key, parsed_id)
-                .await?
-            {
+            match self.fetch_order_snapshot(&meta.pool_key, parsed_id).await? {
                 Some(snapshot) => {
                     let terminal = snapshot.status == OrderStatus::Filled
                         || snapshot.status == OrderStatus::Cancelled
@@ -911,15 +932,11 @@ mod tests {
         let environment = env_var_non_empty(ENVIRONMENT_ENV)
             .and_then(|value| parse_environment(&value))
             .unwrap_or(DeepbookEnvironment::Mainnet);
-        let mut sdk_config = DeepbookSdkConfig::new(
-            fullnode_url,
-            signer_key,
-            balance_manager_id,
-            environment,
-        );
+        let mut sdk_config =
+            DeepbookSdkConfig::new(fullnode_url, signer_key, balance_manager_id, environment);
 
-        if let Some(gas_budget) = env_var_non_empty(GAS_BUDGET_ENV)
-            .and_then(|value| value.parse::<u64>().ok())
+        if let Some(gas_budget) =
+            env_var_non_empty(GAS_BUDGET_ENV).and_then(|value| value.parse::<u64>().ok())
         {
             sdk_config = sdk_config.with_gas_budget(gas_budget);
         }
@@ -953,7 +970,9 @@ mod tests {
             Ok(backend) => Ok(Some((backend, inputs))),
             Err(err) => {
                 debug_env_snapshot();
-                eprintln!("skipping deepbook SDK backend tests: failed to construct backend: {err:?}");
+                eprintln!(
+                    "skipping deepbook SDK backend tests: failed to construct backend: {err:?}"
+                );
                 Ok(None)
             }
         }
@@ -967,16 +986,14 @@ mod tests {
         };
 
         let request = inputs.order_request.clone();
-        let snapshot = backend
-            .place_post_only_order(request.clone())
-            .await?;
+        let snapshot = backend.place_post_only_order(request.clone()).await?;
 
         assert_eq!(snapshot.pair, request.pair);
         assert_eq!(snapshot.side, request.side);
         assert!(snapshot.price > 0.0);
         assert!(snapshot.size > 0.0);
 
-        let _ = backend.cancel_order(&snapshot.id).await?;
+        // let _ = backend.cancel_order(&snapshot.id).await?;
 
         Ok(())
     }
@@ -989,9 +1006,7 @@ mod tests {
         };
 
         let request = inputs.order_request.clone();
-        let snapshot = backend
-            .place_post_only_order(request)
-            .await?;
+        let snapshot = backend.place_post_only_order(request).await?;
         let order_id = snapshot.id.clone();
 
         let cancelled = backend.cancel_order(&order_id).await?;
@@ -1020,9 +1035,7 @@ mod tests {
         };
 
         let request = inputs.order_request.clone();
-        let created = backend
-            .place_post_only_order(request)
-            .await?;
+        let created = backend.place_post_only_order(request).await?;
 
         let cancelled = backend.cancel_all().await?;
         assert!(

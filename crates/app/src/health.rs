@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use cex_execution::PositionManager;
 use lending::LendingClient;
 use serde_json::json;

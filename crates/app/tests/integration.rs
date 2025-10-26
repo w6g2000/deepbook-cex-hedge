@@ -26,6 +26,7 @@ async fn end_to_end_place_and_shutdown() -> Result<()> {
         lending_client.clone(),
         engine.command_sender(),
         Arc::clone(&health_metrics),
+        None,
     );
     let (tx_cex, rx_cex) = mpsc::channel(8);
     let (tx_deep, rx_deep) = mpsc::channel(8);

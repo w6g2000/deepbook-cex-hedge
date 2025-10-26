@@ -33,7 +33,7 @@ pub enum OrderStatus {
 }
 
 impl OrderStatus {
-    fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         matches!(self, OrderStatus::Open | OrderStatus::PartiallyFilled)
     }
 
@@ -103,6 +103,16 @@ impl ClaimSummary {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PoolAccountSnapshot {
+    pub settled_base: f64,
+    pub settled_quote: f64,
+    pub owed_base: f64,
+    pub owed_quote: f64,
+    pub unclaimed_base: f64,
+    pub unclaimed_quote: f64,
+}
+
 #[async_trait]
 pub trait DeepbookBackend: Send + Sync {
     async fn place_post_only_order(&self, request: PlaceOrderRequest) -> Result<OrderSnapshot>;
@@ -110,6 +120,8 @@ pub trait DeepbookBackend: Send + Sync {
     async fn cancel_all(&self) -> Result<Vec<OrderSnapshot>>;
     async fn record_fill(&self, order_id: &str, fill: FillUpdate) -> Result<OrderSnapshot>;
     async fn claim_fills(&self) -> Result<ClaimSummary>;
+    async fn withdraw_settled(&self, pool_key: &str) -> Result<Option<ClaimableBalance>>;
+    async fn pool_account_snapshot(&self, pool_key: &str) -> Result<PoolAccountSnapshot>;
     async fn get_order(&self, order_id: &str) -> Result<Option<OrderSnapshot>>;
     async fn list_orders(&self) -> Result<Vec<OrderSnapshot>>;
 }
@@ -160,6 +172,17 @@ impl DeepbookExecution {
 
     pub async fn claim_fills(&self) -> Result<ClaimSummary> {
         self.backend.claim_fills().await
+    }
+
+    pub async fn withdraw_settled_amounts(
+        &self,
+        pool_key: &str,
+    ) -> Result<Option<ClaimableBalance>> {
+        self.backend.withdraw_settled(pool_key).await
+    }
+
+    pub async fn pool_account_snapshot(&self, pool_key: &str) -> Result<PoolAccountSnapshot> {
+        self.backend.pool_account_snapshot(pool_key).await
     }
 
     pub async fn get_order(&self, order_id: &str) -> Result<Option<OrderSnapshot>> {
@@ -370,6 +393,23 @@ impl DeepbookBackend for InMemoryBackend {
         let snapshot = claims.clone();
         claims.clear();
         Ok(ClaimSummary::from_map(snapshot))
+    }
+
+    async fn withdraw_settled(&self, pool_key: &str) -> Result<Option<ClaimableBalance>> {
+        let pair_label = pool_key.replace('_', "/");
+        let mut claims = self.inner.claimables.lock().await;
+        Ok(claims.remove(&pair_label))
+    }
+
+    async fn pool_account_snapshot(&self, pool_key: &str) -> Result<PoolAccountSnapshot> {
+        let pair_label = pool_key.replace('_', "/");
+        let claims = self.inner.claimables.lock().await;
+        let balance = claims.get(&pair_label).cloned().unwrap_or_default();
+        Ok(PoolAccountSnapshot {
+            settled_base: balance.base_asset,
+            settled_quote: balance.quote_asset,
+            ..Default::default()
+        })
     }
 
     async fn get_order(&self, order_id: &str) -> Result<Option<OrderSnapshot>> {

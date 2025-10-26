@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cex_execution::{BinancePerpExecutor, CexExecutor, PositionManager};
+use cex_execution::{BinancePerpExecutor, BinanceSpotExecutor, CexExecutor, PositionManager};
 use cex_watcher::CexWatcher;
 use deepbook_cex_app::{HealthServer, ShutdownCoordinator};
 use deepbook_execution::DeepbookExecution;
@@ -59,12 +59,23 @@ async fn main() -> Result<()> {
     let lending_client = LendingClient::from_config(&config);
     let health_metrics = HealthMetrics::new();
     let (engine, order_rx) = ExecutionEngine::new(256);
+    let spot_executor = match BinanceSpotExecutor::from_config(&config.cex) {
+        Ok(exec) => Some(Arc::new(exec)),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to initialize Binance spot executor; rebalancing disabled"
+            );
+            None
+        }
+    };
     let strategy = StrategyEngine::new(
         &config,
         deepbook_executor.clone(),
         lending_client.clone(),
         engine.command_sender(),
         Arc::clone(&health_metrics),
+        spot_executor.clone(),
     );
     let strategy_handle = strategy.spawn(cex_events, deepbook_events);
 

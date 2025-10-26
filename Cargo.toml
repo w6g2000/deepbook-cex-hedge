@@ -36,7 +36,7 @@ sui-types = { git = "https://github.com/mystenlabs/sui", package = "sui-types" }
 sui-deepbookv3 = { git = "https://github.com/w6g2000/sui-deepbookv3.git" }
 sui-keys = { git = "https://github.com/mystenlabs/sui", package = "sui-keys" }
 shared-crypto = { git = "https://github.com/mystenlabs/sui", package = "shared-crypto" }
-binance-sdk = { version = "25.0.0", default-features = false, features = ["spot"] }
+binance-sdk = { version = "25.0.0", default-features = false, features = ["spot", "wallet"] }
 rust_decimal = "1.37"
 dotenvy = "0.15"
 openssl = { version = "0.10", features = ["vendored"] }

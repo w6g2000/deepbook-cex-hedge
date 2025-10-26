@@ -11,3 +11,4 @@ shared = { path = "../shared" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+cex-execution = { path = "../cex-execution" }

@@ -329,9 +329,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires external network access to Deepbook indexer"]
     async fn polling_loop_hits_real_endpoint() {
-        let _ = tracing_subscriber::fmt()
-            .with_target(false)
-            .try_init();
+        let _ = tracing_subscriber::fmt().with_target(false).try_init();
 
         let pair = TradingPair {
             base: "WAL".to_string(),
@@ -388,7 +386,10 @@ mod tests {
             }
         }
 
-        assert!(snapshots > 0, "expected at least one orderbook snapshot within 5s");
+        assert!(
+            snapshots > 0,
+            "expected at least one orderbook snapshot within 5s"
+        );
         assert!(saw_expected_pair, "expected WAL/USDC deepbook snapshots");
         assert!(saw_liquidity, "orderbook should contain bids or asks");
 

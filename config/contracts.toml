@@ -5,6 +5,41 @@ navi_market = "0xNAVIMARKETPLACEHOLDER"
 navi_price_oracle = "0xNAVIORACLEPLACEHOLDER"
 deepbook_pool = "0xDEEPBOOKPOOLPLACEHOLDER"
 
+[lending_navi]
+rpc_endpoint = "https://fullnode.mainnet.sui.io:443"
+package_id = "0x81c408448d0d57b3e371ea94de1d40bf852784d3e225de1e74acab3e8395c18f"
+module = "incentive_v3"
+function = "entry_deposit"
+coin_type = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC"
+coin_decimals = 6
+asset_id = 10
+gas_budget = 60_000_000
+
+[lending_navi.clock]
+object_id = "0x0000000000000000000000000000000000000000000000000000000000000006"
+initial_shared_version = 1
+mutable = false
+
+[lending_navi.storage]
+object_id = "0xbb4e2f4b6205c2e2a2db47aeb4f830796ec7c005f88537ee775986639bc442fe"
+initial_shared_version = 8_202_844
+mutable = true
+
+[lending_navi.pool]
+object_id = "0xa3582097b4c57630046c0c49a88bfc6b202a3ec0a9db5597c31765f7563755a8"
+initial_shared_version = 372_449_049
+mutable = true
+
+[lending_navi.incentive_v2]
+object_id = "0xf87a8acb8b81d14307894d12595541a73f19933f88e1326d5be349c7a6f7559c"
+initial_shared_version = 38_232_222
+mutable = true
+
+[lending_navi.incentive_v3]
+object_id = "0x62982dad27fb10bb314b3384d5de8d2ac2d72ab2dbeae5d801dbdb9efa816c80"
+initial_shared_version = 496_060_210
+mutable = true
+
 [deepbook_execution]
 rpc_endpoint = "https://fullnode.mainnet.sui.io:443"
 package_id = "0x0517b8c5ca29fbb9f09cf77530ba331f30f59b6203d13d28796e76e362cc0e12"

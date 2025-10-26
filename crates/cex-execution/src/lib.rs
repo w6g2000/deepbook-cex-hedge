@@ -1,31 +1,40 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use shared::{config::CexConfig, types::MarketSide};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::env;
+use std::{
+    collections::HashMap,
+    env,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 use tokio::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use binance_sdk::{
     config::ConfigurationRestApi,
     spot::{
-        rest_api::{
-            self,
-            DeleteOpenOrdersParams,
-            DeleteOrderParams,
-            GetAccountParams,
-            NewOrderNewOrderRespTypeEnum,
-            NewOrderParams,
-            NewOrderSideEnum,
-            NewOrderTimeInForceEnum,
-            NewOrderTypeEnum,
-        },
         SpotRestApi,
+        rest_api::{
+            self, DeleteOpenOrdersParams, DeleteOrderParams, GetAccountParams,
+            NewOrderNewOrderRespTypeEnum, NewOrderParams, NewOrderSideEnum,
+            NewOrderTimeInForceEnum, NewOrderTypeEnum,
+        },
+    },
+    wallet::{
+        WalletRestApi,
+        rest_api::{
+            self as wallet_rest_api, WithdrawParams as WalletWithdrawParams,
+            WithdrawResponse as WalletWithdrawResponse,
+        },
     },
 };
 use dotenvy::dotenv;
-use rust_decimal::{Decimal, prelude::FromPrimitive};
+use rust_decimal::{
+    Decimal,
+    prelude::{FromPrimitive, ToPrimitive},
+};
 
 #[derive(Debug, Clone)]
 pub struct CexOrderRequest {
@@ -53,6 +62,18 @@ pub struct ExchangePosition {
     pub pair: String,
     pub net_position: f64,
     pub avg_entry_price: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpotBalance {
+    pub free: f64,
+    pub locked: f64,
+}
+
+impl SpotBalance {
+    pub fn total(&self) -> f64 {
+        self.free + self.locked
+    }
 }
 
 #[async_trait]
@@ -204,9 +225,38 @@ impl BinanceEnvironment {
     }
 }
 
+#[async_trait]
+trait BinanceWalletClient: Send + Sync + std::fmt::Debug {
+    async fn withdraw(&self, params: WalletWithdrawParams) -> Result<WalletWithdrawResponse>;
+}
+
+#[derive(Debug, Clone)]
+struct DefaultWalletClient {
+    client: wallet_rest_api::RestApi,
+}
+
+impl DefaultWalletClient {
+    fn new(client: wallet_rest_api::RestApi) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl BinanceWalletClient for DefaultWalletClient {
+    async fn withdraw(&self, params: WalletWithdrawParams) -> Result<WalletWithdrawResponse> {
+        let response = self.client.withdraw(params).await?;
+        let data = response
+            .data()
+            .await
+            .context("Binance withdraw response parsing failed")?;
+        Ok(data)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BinanceSpotExecutor {
     client: rest_api::RestApi,
+    wallet_client: Arc<dyn BinanceWalletClient>,
     recv_window: Option<Decimal>,
     environment: BinanceEnvironment,
 }
@@ -218,7 +268,7 @@ impl BinanceSpotExecutor {
         environment: BinanceEnvironment,
         recv_window_ms: Option<u64>,
     ) -> Result<Self> {
-        let mut builder = ConfigurationRestApi::builder()
+        let builder = ConfigurationRestApi::builder()
             .api_key(api_key)
             .api_secret(api_secret);
 
@@ -227,17 +277,25 @@ impl BinanceSpotExecutor {
             .transpose()
             .context("invalid recv_window_ms value")?;
 
-        let rest_conf = builder
+        let config = builder
             .build()
             .context("failed to build Binance REST configuration")?;
 
+        let spot_conf = config.clone();
+        let wallet_conf = config;
+
         let client = match environment {
-            BinanceEnvironment::Production => SpotRestApi::production(rest_conf),
-            BinanceEnvironment::Testnet => SpotRestApi::testnet(rest_conf),
+            BinanceEnvironment::Production => SpotRestApi::production(spot_conf),
+            BinanceEnvironment::Testnet => SpotRestApi::testnet(spot_conf),
         };
+
+        let wallet_api = WalletRestApi::from_config(wallet_conf);
+        let wallet_client: Arc<dyn BinanceWalletClient> =
+            Arc::new(DefaultWalletClient::new(wallet_api));
 
         Ok(Self {
             client,
+            wallet_client,
             recv_window,
             environment,
         })
@@ -294,9 +352,155 @@ impl BinanceSpotExecutor {
         }
     }
 
+    fn wallet_recv_window_ms(&self) -> Option<i64> {
+        self.recv_window.as_ref().and_then(|value| value.to_i64())
+    }
+
+    fn build_withdraw_params(
+        &self,
+        coin: &str,
+        address: &str,
+        amount: f64,
+        network: Option<&str>,
+        address_tag: Option<&str>,
+        withdraw_order_id: Option<&str>,
+    ) -> Result<WalletWithdrawParams> {
+        ensure!(!coin.trim().is_empty(), "coin symbol cannot be empty");
+        ensure!(
+            !address.trim().is_empty(),
+            "withdraw address cannot be empty"
+        );
+        ensure!(amount > 0.0, "withdraw amount must be positive");
+
+        let decimal_amount = decimal_from_f64(amount, "amount")?;
+        let mut builder = WalletWithdrawParams::builder(
+            coin.trim().to_uppercase(),
+            address.trim().to_string(),
+            decimal_amount,
+        );
+
+        if let Some(order_id) = withdraw_order_id.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }) {
+            builder = builder.withdraw_order_id(order_id);
+        }
+
+        if let Some(network) = network.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_uppercase())
+            }
+        }) {
+            builder = builder.network(network);
+        }
+
+        if let Some(tag) = address_tag.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }) {
+            builder = builder.address_tag(tag);
+        }
+
+        if let Some(recv) = self.wallet_recv_window_ms() {
+            builder = builder.recv_window(recv);
+        }
+
+        builder
+            .build()
+            .context("failed to build Binance withdraw params")
+    }
+
+    pub async fn withdraw_spot(
+        &self,
+        coin: &str,
+        address: &str,
+        amount: f64,
+        network: Option<&str>,
+        address_tag: Option<&str>,
+        withdraw_order_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let params = self.build_withdraw_params(
+            coin,
+            address,
+            amount,
+            network,
+            address_tag,
+            withdraw_order_id,
+        )?;
+
+        info!(
+            coin = %params.coin,
+            address = %params.address,
+            amount = %params.amount,
+            network = ?params.network,
+            address_tag = ?params.address_tag,
+            withdraw_order_id = ?params.withdraw_order_id,
+            "submitting Binance spot withdraw"
+        );
+
+        let response = match self.wallet_client.withdraw(params.clone()).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                error!(
+                    error = %err,
+                    coin = %params.coin,
+                    address = %params.address,
+                    network = ?params.network,
+                    withdraw_order_id = ?params.withdraw_order_id,
+                    "Binance spot withdraw failed"
+                );
+                return Err(err);
+            }
+        };
+        let withdraw_id = response.id.clone();
+
+        info!(
+            withdraw_id = withdraw_id.as_deref().unwrap_or(""),
+            "Binance spot withdraw accepted"
+        );
+
+        Ok(withdraw_id)
+    }
+
+    pub async fn fetch_balances(&self) -> Result<HashMap<String, SpotBalance>> {
+        let params = GetAccountParams::default();
+        let response = self
+            .client
+            .get_account(params)
+            .await
+            .context("Binance 查询账户资产失败")?;
+        let account = response.data().await.context("解析 Binance 账户资产失败")?;
+
+        let mut balances = HashMap::new();
+        for entry in account.balances.unwrap_or_default() {
+            let asset = entry.asset.clone().unwrap_or_default().to_uppercase();
+            if asset.is_empty() {
+                continue;
+            }
+            let free = Self::parse_decimal(entry.free.as_ref())?;
+            let locked = Self::parse_decimal(entry.locked.as_ref())?;
+            balances.insert(asset, SpotBalance { free, locked });
+        }
+        Ok(balances)
+    }
+
     fn parse_decimal(value: Option<&String>) -> Result<f64> {
         let parsed = value
-            .map(|s| s.parse::<f64>().with_context(|| format!("无法解析数值 {}", s)))
+            .map(|s| {
+                s.parse::<f64>()
+                    .with_context(|| format!("无法解析数值 {}", s))
+            })
             .transpose()?
             .unwrap_or(0.0);
         Ok(parsed)
@@ -372,10 +576,7 @@ impl CexExecutor for BinanceSpotExecutor {
             .await
             .context("Binance new_order 解析响应失败")?;
 
-        let order_symbol = data
-            .symbol
-            .clone()
-            .unwrap_or_else(|| symbol.clone());
+        let order_symbol = data.symbol.clone().unwrap_or_else(|| symbol.clone());
         let raw_order_id = data
             .order_id
             .map(|id| id.to_string())
@@ -393,13 +594,15 @@ impl CexExecutor for BinanceSpotExecutor {
             0.0
         };
 
-        let slippage_bps = maybe_price.map(|p| {
-            if p.abs() < f64::EPSILON {
-                0.0
-            } else {
-                ((avg_fill_price - p) / p) * 10_000.0
-            }
-        }).unwrap_or(0.0);
+        let slippage_bps = maybe_price
+            .map(|p| {
+                if p.abs() < f64::EPSILON {
+                    0.0
+                } else {
+                    ((avg_fill_price - p) / p) * 10_000.0
+                }
+            })
+            .unwrap_or(0.0);
 
         let order_id = format!(
             "{}{}{}",
@@ -494,15 +697,15 @@ impl CexExecutor for BinanceSpotExecutor {
             .get_account(params)
             .await
             .context("Binance 查询账户资产失败")?;
-        let account = response
-            .data()
-            .await
-            .context("解析 Binance 账户资产失败")?;
+        let account = response.data().await.context("解析 Binance 账户资产失败")?;
 
         let balances = account.balances.unwrap_or_default();
-        let balance = balances
-            .into_iter()
-            .find(|b| b.asset.as_deref().map(|s| s.eq_ignore_ascii_case(&base_asset)) == Some(true));
+        let balance = balances.into_iter().find(|b| {
+            b.asset
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case(&base_asset))
+                == Some(true)
+        });
 
         if let Some(entry) = balance {
             let free = Self::parse_decimal(entry.free.as_ref())?;
@@ -638,8 +841,7 @@ fn weighted_average(a_price: f64, a_size: f64, b_price: f64, b_size: f64) -> f64
 }
 
 fn decimal_from_f64(value: f64, field: &str) -> Result<Decimal> {
-    Decimal::from_f64(value)
-        .ok_or_else(|| anyhow!("{} 数值无法转换为 Decimal：{}", field, value))
+    Decimal::from_f64(value).ok_or_else(|| anyhow!("{} 数值无法转换为 Decimal：{}", field, value))
 }
 
 fn decimal_from_u64(value: u64) -> Result<Decimal> {
@@ -649,6 +851,44 @@ fn decimal_from_u64(value: u64) -> Result<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy)]
+    struct WithdrawSmokeConfig {
+        enabled: bool,
+        use_testnet: bool,
+        recv_window_ms: Option<u64>,
+        api_key: Option<&'static str>,
+        api_secret: Option<&'static str>,
+        coin: Option<&'static str>,
+        address: Option<&'static str>,
+        amount: Option<f64>,
+        network: Option<&'static str>,
+        address_tag: Option<&'static str>,
+        withdraw_order_id: Option<&'static str>,
+    }
+
+    const WITHDRAW_SMOKE_CONFIG: WithdrawSmokeConfig = WithdrawSmokeConfig {
+        enabled: false,
+        use_testnet: false,
+        recv_window_ms: Some(5000),
+        api_key: Some(""),
+        api_secret: Some(""),
+        coin: Some("WAL"),
+        address: Some("0xdf6325562dae096110fc3a87a2d4c8727752a749aa583000dcbd6c42e4fba655"),
+        amount: Some(5.0),
+        network: Some("SUI"),
+        address_tag: None,
+        withdraw_order_id: None,
+    };
+
+    fn require_str(value: Option<&'static str>, name: &str) -> Result<&'static str> {
+        value.ok_or_else(|| anyhow!("{name} not configured in WITHDRAW_SMOKE_CONFIG"))
+    }
+
+    fn require_amount(value: Option<f64>, name: &str) -> Result<f64> {
+        value.ok_or_else(|| anyhow!("{name} not configured in WITHDRAW_SMOKE_CONFIG"))
+    }
 
     #[test]
     fn long_position_realizes_pnl_when_selling() {
@@ -730,5 +970,218 @@ mod tests {
         assert_eq!(update.filled_size, 5.0);
         assert_eq!(update.remaining_size, 5.0);
         assert_eq!(update.net_position, 5.0);
+    }
+
+    #[test]
+    fn build_withdraw_params_normalizes_inputs() {
+        let executor = BinanceSpotExecutor::new(
+            "key".to_string(),
+            "secret".to_string(),
+            BinanceEnvironment::Testnet,
+            Some(5000),
+        )
+        .expect("executor init");
+
+        let params = executor
+            .build_withdraw_params(
+                " usdc ",
+                " 0xabc123 ",
+                42.5,
+                Some(" trx "),
+                Some(" memo-1 "),
+                Some(" order-123 "),
+            )
+            .expect("build params");
+
+        assert_eq!(params.coin, "USDC");
+        assert_eq!(params.address, "0xabc123");
+        assert_eq!(
+            params.amount,
+            decimal_from_f64(42.5, "amount").expect("decimal")
+        );
+        assert_eq!(params.network.as_deref(), Some("TRX"));
+        assert_eq!(params.address_tag.as_deref(), Some("memo-1"));
+        assert_eq!(params.withdraw_order_id.as_deref(), Some("order-123"));
+        assert_eq!(params.recv_window, Some(5000));
+    }
+
+    #[test]
+    fn build_withdraw_params_rejects_non_positive_amount() {
+        let executor = BinanceSpotExecutor::new(
+            "key".to_string(),
+            "secret".to_string(),
+            BinanceEnvironment::Production,
+            None,
+        )
+        .expect("executor init");
+
+        let err = executor
+            .build_withdraw_params("USDC", "0xabc", 0.0, None, None, None)
+            .expect_err("zero amount should error");
+        assert!(
+            err.to_string().contains("withdraw amount must be positive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct RecordingWalletClient {
+        calls: Mutex<Vec<WalletWithdrawParams>>,
+        response: WalletWithdrawResponse,
+    }
+
+    impl RecordingWalletClient {
+        fn with_id(id: &str) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                response: WalletWithdrawResponse {
+                    id: Some(id.to_string()),
+                },
+            }
+        }
+
+        fn take_last(&self) -> WalletWithdrawParams {
+            self.calls
+                .lock()
+                .expect("lock wallet client calls")
+                .pop()
+                .expect("expected at least one call")
+        }
+    }
+
+    #[async_trait]
+    impl BinanceWalletClient for RecordingWalletClient {
+        async fn withdraw(&self, params: WalletWithdrawParams) -> Result<WalletWithdrawResponse> {
+            self.calls
+                .lock()
+                .expect("lock wallet client calls")
+                .push(params.clone());
+            Ok(self.response.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ErrorWalletClient;
+
+    #[async_trait]
+    impl BinanceWalletClient for ErrorWalletClient {
+        async fn withdraw(&self, _params: WalletWithdrawParams) -> Result<WalletWithdrawResponse> {
+            Err(anyhow!("wallet withdraw failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn withdraw_spot_invokes_wallet_client() {
+        let mut executor = BinanceSpotExecutor::new(
+            "key".to_string(),
+            "secret".to_string(),
+            BinanceEnvironment::Testnet,
+            Some(5000),
+        )
+        .expect("executor init");
+
+        let wallet_client = Arc::new(RecordingWalletClient::with_id("withdraw-123"));
+        executor.wallet_client = wallet_client.clone();
+
+        let result = executor
+            .withdraw_spot(
+                " usdc ",
+                " 0xabc123 ",
+                10.5,
+                Some(" trx "),
+                Some(" memo "),
+                Some(" order-1 "),
+            )
+            .await
+            .expect("withdraw should succeed");
+
+        assert_eq!(result.as_deref(), Some("withdraw-123"));
+
+        let params = wallet_client.take_last();
+        assert_eq!(params.coin, "USDC");
+        assert_eq!(params.address, "0xabc123");
+        assert_eq!(
+            params.amount,
+            decimal_from_f64(10.5, "amount").expect("decimal")
+        );
+        assert_eq!(params.network.as_deref(), Some("TRX"));
+        assert_eq!(params.address_tag.as_deref(), Some("memo"));
+        assert_eq!(params.withdraw_order_id.as_deref(), Some("order-1"));
+        assert_eq!(params.recv_window, Some(5000));
+    }
+
+    #[tokio::test]
+    async fn withdraw_spot_propagates_wallet_errors() {
+        let mut executor = BinanceSpotExecutor::new(
+            "".to_string(),
+            "".to_string(),
+            BinanceEnvironment::Production,
+            None,
+        )
+        .expect("executor init");
+
+        executor.wallet_client = Arc::new(ErrorWalletClient);
+
+        let err = executor
+            .withdraw_spot(
+                "WAL",
+                "0xdf6325562dae096110fc3a87a2d4c8727752a749aa583000dcbd6c42e4fba655",
+                5.0,
+                Some("SUI"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("expected withdraw error");
+
+        assert!(
+            err.to_string().contains("wallet withdraw failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_spot_real_environment_smoke() -> Result<()> {
+        let _ = dotenv();
+
+        let config = WITHDRAW_SMOKE_CONFIG;
+
+        if !config.enabled {
+            info!(
+                "skipping real withdraw smoke test; set WITHDRAW_SMOKE_CONFIG.enabled = true to run"
+            );
+            return Ok(());
+        }
+
+        let executor = BinanceSpotExecutor::new(
+            require_str(config.api_key, "api_key")?.to_string(),
+            require_str(config.api_secret, "api_secret")?.to_string(),
+            BinanceEnvironment::from_flag(config.use_testnet),
+            config.recv_window_ms,
+        )?;
+
+        let withdraw_id = executor
+            .withdraw_spot(
+                require_str(config.coin, "coin")?,
+                require_str(config.address, "address")?,
+                require_amount(config.amount, "amount")?,
+                config.network.map(|value| value as &str),
+                config.address_tag.map(|value| value as &str),
+                config.withdraw_order_id.map(|value| value as &str),
+            )
+            .await
+            .context("Binance withdraw request failed")?;
+
+        ensure!(
+            withdraw_id.is_some(),
+            "Binance withdraw response missing id"
+        );
+
+        info!(
+            id = withdraw_id.as_deref(),
+            "real Binance withdraw smoke test succeeded"
+        );
+
+        Ok(())
     }
 }

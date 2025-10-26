@@ -1,12 +1,14 @@
 use anyhow::{Result, anyhow};
+use cex_execution::BinanceSpotExecutor;
 use deepbook_execution::{DeepbookExecution, OrderSnapshot, PlaceOrderRequest};
 use lending::LendingClient;
 use shared::config::{AppConfig, ArbitrageConfig, StrategyConfig, TradingPair};
 use shared::metrics::HealthMetrics;
 use shared::types::{MarketEvent, MarketSide, MarketVenue, OrderBookLevel, OrderCommand};
 use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Interval, MissedTickBehavior, interval};
@@ -20,9 +22,10 @@ const DEFAULT_MIN_BOOK_DEPTH: f64 = 500.0;
 const DEFAULT_CEX_VOLATILITY_BPS: f64 = 150.0;
 const DEFAULT_REBID_THRESHOLD_BPS: f64 = 5.0;
 const DEFAULT_MIN_SPREAD_BPS: f64 = 10.0;
-const CLAIM_INTERVAL: Duration = Duration::from_secs(10);
 const LENDING_INTERVAL: Duration = Duration::from_secs(30);
+const ORDER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LADDER_LEVELS: usize = 2;
+const SPOT_WITHDRAW_THRESHOLD_ENV: &str = "SPOT_WITHDRAW_THRESHOLD_BPS";
 
 #[derive(Clone)]
 pub struct StrategyEngine {
@@ -34,6 +37,14 @@ pub struct StrategyEngine {
     order_tx: mpsc::Sender<OrderCommand>,
     risk: RiskManager<LoggerNotifier>,
     metrics: Arc<HealthMetrics>,
+    spot_executor: Option<Arc<BinanceSpotExecutor>>,
+    rebalance_min_notional: f64,
+    rebalance_cooldown: Duration,
+    borrow_alert_ratio: f64,
+    borrow_target_ratio: f64,
+    deposit_address: Option<String>,
+    deposit_network: Option<String>,
+    deposit_memo: Option<String>,
 }
 
 impl StrategyEngine {
@@ -43,11 +54,17 @@ impl StrategyEngine {
         lending: LendingClient,
         order_tx: mpsc::Sender<OrderCommand>,
         metrics: Arc<HealthMetrics>,
+        spot_executor: Option<Arc<BinanceSpotExecutor>>,
     ) -> Self {
         let strategy = config.strategy.clone();
         let arbitrage = config.arbitrage.clone();
         let params = StrategyParams::from_config(&strategy, &arbitrage);
         let pairs = select_pairs(config);
+        let rebalance = config.rebalance.clone();
+        let rebalance_min_notional = rebalance.min_notional();
+        let rebalance_cooldown = Duration::from_secs(rebalance.cooldown_secs());
+        let borrow_alert_ratio = rebalance.borrow_alert_ratio();
+        let borrow_target_ratio = rebalance.borrow_target_ratio();
 
         Self {
             params,
@@ -58,6 +75,14 @@ impl StrategyEngine {
             order_tx,
             risk: RiskManager::new(LoggerNotifier),
             metrics,
+            spot_executor,
+            rebalance_min_notional,
+            rebalance_cooldown,
+            borrow_alert_ratio,
+            borrow_target_ratio,
+            deposit_address: rebalance.deposit_address,
+            deposit_network: rebalance.deposit_network,
+            deposit_memo: rebalance.deposit_memo,
         }
     }
 
@@ -90,8 +115,8 @@ impl StrategyEngine {
             })
             .collect::<HashMap<_, _>>();
 
-        let mut claim_timer = strategy_interval(CLAIM_INTERVAL);
         let mut lending_timer = strategy_interval(LENDING_INTERVAL);
+        let mut order_poll_timer = strategy_interval(ORDER_POLL_INTERVAL);
 
         loop {
             tokio::select! {
@@ -101,11 +126,11 @@ impl StrategyEngine {
                 Some(event) = deepbook_rx.recv() => {
                     self.handle_market_event(event, VenueKind::Deepbook, &mut pair_states).await?;
                 }
-                _ = claim_timer.tick() => {
-                    self.handle_claims(&mut pair_states).await?;
-                }
                 _ = lending_timer.tick() => {
                     self.rebalance_lending().await?;
+                }
+                _ = order_poll_timer.tick() => {
+                    self.poll_active_orders(&mut pair_states).await?;
                 }
                 changed = shutdown_rx.changed() => {
                     if changed.is_ok() && *shutdown_rx.borrow() {
@@ -151,6 +176,10 @@ impl StrategyEngine {
     }
 
     async fn evaluate_pair(&self, state: &mut StrategyPairState) -> Result<()> {
+        if state.is_suspended() {
+            return Ok(());
+        }
+
         if state.cex_mid().is_none() || state.deepbook_mid().is_none() {
             return Ok(());
         }
@@ -255,7 +284,6 @@ impl StrategyEngine {
         for state in pair_states.values_mut() {
             self.cancel_all_orders(state).await?;
         }
-        self.handle_claims(pair_states).await?;
         Ok(())
     }
 
@@ -362,45 +390,67 @@ impl StrategyEngine {
         pair_label.replace('/', "_").to_uppercase()
     }
 
-    async fn handle_claims(
+    async fn poll_active_orders(
         &self,
         pair_states: &mut HashMap<String, StrategyPairState>,
     ) -> Result<()> {
-        let summary = self.deepbook.claim_fills().await?;
-        if summary.total_base == 0.0 && summary.total_quote == 0.0 {
-            return Ok(());
+        let open_orders = self.deepbook.list_orders().await?;
+        let mut indexed = HashMap::new();
+        for order in open_orders {
+            indexed.insert(order.id.clone(), order);
         }
 
-        for (pair_label, balance) in summary.per_pair {
-            if balance.base_asset <= 0.0 && balance.quote_asset <= 0.0 {
-                continue;
-            }
+        let mut withdraw_pairs = Vec::new();
 
-            let state = pair_states
-                .entry(pair_label.clone())
-                .or_insert_with(|| StrategyPairState::new(pair_label.clone()));
+        for state in pair_states.values_mut() {
+            let mut removals = Vec::new();
+            let mut hedges = Vec::new();
+            let latest_mid = state.latest_mid();
+            let mut needs_withdraw = false;
 
-            if balance.base_asset > 0.0 {
-                self.send_hedge_command(
-                    &state.pair_label,
-                    MarketSide::Ask,
-                    balance.base_asset,
-                    None,
-                )
-                .await?;
-            }
-
-            if balance.quote_asset > 0.0
-                && let Some(mid) = state.latest_mid()
-                && mid > 0.0
-            {
-                let size = balance.quote_asset / mid;
-                if size > 0.0 {
-                    self.send_hedge_command(&state.pair_label, MarketSide::Bid, size, Some(mid))
-                        .await?;
+            for active in state.orders.iter_mut() {
+                if let Some(snapshot) = indexed.get(&active.snapshot.id) {
+                    let snapshot = snapshot.clone();
+                    let fill_delta = snapshot.filled_base - active.last_reported_base;
+                    if fill_delta > 0.0 {
+                        let hedge_side = match snapshot.side.clone() {
+                            MarketSide::Bid => MarketSide::Ask,
+                            MarketSide::Ask => MarketSide::Bid,
+                        };
+                        let price_hint = latest_mid.or(Some(snapshot.price));
+                        hedges.push((state.pair_label.clone(), hedge_side, fill_delta, price_hint));
+                        needs_withdraw = true;
+                    }
+                    active.last_reported_base = snapshot.filled_base;
+                    active.snapshot = snapshot.clone();
+                    if !snapshot.status.is_active() {
+                        removals.push((active.level, active.side.clone()));
+                    }
+                } else {
+                    // TODO: 下单后立即轮询可能暂时查不到订单，必要时增加重试确认。
                 }
             }
+
+            for (pair_label, side, size, price) in hedges {
+                self.send_hedge_command(&pair_label, side, size, price)
+                    .await?;
+            }
+
+            for (level, side) in removals {
+                state.remove_order(level, side);
+            }
+
+            if needs_withdraw {
+                withdraw_pairs.push(state.pair_label.clone());
+            }
         }
+
+        for pair_label in withdraw_pairs {
+            self.withdraw_settled_for_pair(&pair_label).await?;
+        }
+
+        self.evaluate_inventory(pair_states).await?;
+
         Ok(())
     }
 
@@ -427,35 +477,380 @@ impl StrategyEngine {
         Ok(())
     }
 
+    async fn withdraw_settled_for_pair(&self, pair_label: &str) -> Result<()> {
+        let pool_key = self.pool_key_for_pair(pair_label);
+        if let Some(balance) = self.deepbook.withdraw_settled_amounts(&pool_key).await? {
+            info!(
+                pair = %pair_label,
+                base = balance.base_asset,
+                quote = balance.quote_asset,
+                "withdrew settled balances"
+            );
+        }
+        Ok(())
+    }
+
+    async fn evaluate_inventory(
+        &self,
+        pair_states: &mut HashMap<String, StrategyPairState>,
+    ) -> Result<()> {
+        let Some(spot) = &self.spot_executor else {
+            return Ok(());
+        };
+
+        let balances = spot.fetch_balances().await?;
+        let now = Instant::now();
+
+        for pair in &self.pairs {
+            let pair_label = pair.display_pair();
+            let state = pair_states
+                .entry(pair_label.clone())
+                .or_insert_with(|| StrategyPairState::new(pair_label.clone()));
+
+            let Some(mid) = state.cex_mid() else {
+                continue;
+            };
+            if mid <= 0.0 {
+                continue;
+            }
+
+            let pool_key = self.pool_key_for_pair(&pair_label);
+            let snapshot = self.deepbook.pool_account_snapshot(&pool_key).await?;
+
+            let dex_base =
+                (snapshot.settled_base + snapshot.unclaimed_base - snapshot.owed_base).max(0.0);
+            let dex_quote =
+                (snapshot.settled_quote + snapshot.unclaimed_quote - snapshot.owed_quote).max(0.0);
+
+            let base_symbol = pair.base.to_uppercase();
+            let quote_symbol = pair.quote.to_uppercase();
+
+            let cex_base = balances.get(&base_symbol).map(|b| b.total()).unwrap_or(0.0);
+            let cex_quote = balances
+                .get(&quote_symbol)
+                .map(|b| b.total())
+                .unwrap_or(0.0);
+
+            let dex_value = dex_base * mid + dex_quote;
+            let cex_value = cex_base * mid + cex_quote;
+            let total_value = dex_value + cex_value;
+            if total_value <= f64::EPSILON {
+                continue;
+            }
+
+            let dex_share = dex_value / total_value;
+
+            if dex_share > 0.6 {
+                let value_to_move = dex_value - (total_value * 0.5);
+                self.record_rebalance_to_cex(state, value_to_move, dex_base, dex_quote, mid);
+            } else if dex_share < 0.4 {
+                let value_to_move = (total_value * 0.5) - dex_value;
+                self.record_rebalance_to_dex(state, value_to_move, cex_base, cex_quote, mid);
+            }
+
+            if self.should_execute(state.pending_to_cex(), state.last_rebalance_at, now) {
+                self.execute_rebalance_to_cex(pair, state, now).await?;
+            }
+
+            if self.should_execute(state.pending_to_dex(), state.last_rebalance_at, now) {
+                self.execute_rebalance_to_dex(pair, state, now).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn record_rebalance_to_cex(
+        &self,
+        state: &mut StrategyPairState,
+        value_to_move: f64,
+        available_base: f64,
+        available_quote: f64,
+        mid: f64,
+    ) {
+        if value_to_move <= f64::EPSILON || mid <= f64::EPSILON {
+            return;
+        }
+
+        let current_pending = state.pending_to_cex().notional;
+        if value_to_move <= current_pending + f64::EPSILON {
+            return;
+        }
+
+        let additional_value = value_to_move - current_pending;
+
+        let mut base_amount = (additional_value / mid).min(available_base.max(0.0));
+        if !base_amount.is_finite() {
+            base_amount = 0.0;
+        }
+        let mut moved_value = base_amount * mid;
+        let mut quote_amount = 0.0;
+
+        if moved_value + 1e-6 < additional_value {
+            let remain = additional_value - moved_value;
+            quote_amount = remain.min(available_quote.max(0.0));
+            moved_value += quote_amount;
+        }
+
+        if moved_value <= f64::EPSILON {
+            return;
+        }
+
+        state
+            .pending_to_cex_mut()
+            .add(base_amount, quote_amount, moved_value);
+    }
+
+    fn record_rebalance_to_dex(
+        &self,
+        state: &mut StrategyPairState,
+        value_to_move: f64,
+        available_base: f64,
+        available_quote: f64,
+        mid: f64,
+    ) {
+        if value_to_move <= f64::EPSILON || mid <= f64::EPSILON {
+            return;
+        }
+
+        let current_pending = state.pending_to_dex().notional;
+        if value_to_move <= current_pending + f64::EPSILON {
+            return;
+        }
+
+        let additional_value = value_to_move - current_pending;
+
+        let mut base_amount = (additional_value / mid).min(available_base.max(0.0));
+        if !base_amount.is_finite() {
+            base_amount = 0.0;
+        }
+        let mut moved_value = base_amount * mid;
+        let mut quote_amount = 0.0;
+
+        if moved_value + 1e-6 < additional_value {
+            let remain = additional_value - moved_value;
+            quote_amount = remain.min(available_quote.max(0.0));
+            moved_value += quote_amount;
+        }
+
+        if moved_value <= f64::EPSILON {
+            return;
+        }
+
+        state
+            .pending_to_dex_mut()
+            .add(base_amount, quote_amount, moved_value);
+    }
+
+    fn should_execute(
+        &self,
+        pending: &PendingTransfer,
+        last_execution: Option<Instant>,
+        now: Instant,
+    ) -> bool {
+        if pending.notional < self.rebalance_min_notional {
+            return false;
+        }
+
+        match last_execution {
+            Some(ts) => now.duration_since(ts) >= self.rebalance_cooldown,
+            None => true,
+        }
+    }
+
+    async fn execute_rebalance_to_cex(
+        &self,
+        _pair: &TradingPair,
+        state: &mut StrategyPairState,
+        now: Instant,
+    ) -> Result<()> {
+        let pending = state.take_pending_to_cex();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        state.suspend();
+        self.cancel_all_orders(state).await?;
+
+        if let Err(err) = self
+            .transfer_to_cex(&state.pair_label, pending.base_amount, pending.quote_amount)
+            .await
+        {
+            warn!(
+                pair = %state.pair_label,
+                error = %err,
+                base = pending.base_amount,
+                quote = pending.quote_amount,
+                "dex to cex transfer failed; will retry"
+            );
+            state.pending_to_cex_mut().add(
+                pending.base_amount,
+                pending.quote_amount,
+                pending.notional,
+            );
+            state.last_rebalance_at = Some(now);
+            state.resume();
+            return Ok(());
+        }
+
+        state.last_rebalance_at = Some(now);
+        state.resume();
+        info!(
+            pair = %state.pair_label,
+            base = pending.base_amount,
+            quote = pending.quote_amount,
+            notional = pending.notional,
+            "completed dex to cex rebalance"
+        );
+        Ok(())
+    }
+
+    async fn execute_rebalance_to_dex(
+        &self,
+        pair: &TradingPair,
+        state: &mut StrategyPairState,
+        now: Instant,
+    ) -> Result<()> {
+        let pending = state.take_pending_to_dex();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let Some(executor) = &self.spot_executor else {
+            state.pending_to_dex_mut().add(
+                pending.base_amount,
+                pending.quote_amount,
+                pending.notional,
+            );
+            return Ok(());
+        };
+
+        let Some(address) = self.deposit_address.as_deref() else {
+            warn!(
+                pair = %state.pair_label,
+                "missing CEX deposit address; skipping cex->dex rebalance"
+            );
+            state.pending_to_dex_mut().add(
+                pending.base_amount,
+                pending.quote_amount,
+                pending.notional,
+            );
+            return Ok(());
+        };
+
+        state.suspend();
+        self.cancel_all_orders(state).await?;
+
+        let network = self.deposit_network.as_deref();
+        let memo = self.deposit_memo.as_deref();
+        let mut success = true;
+
+        if pending.base_amount > 0.0 {
+            if let Err(err) = executor
+                .withdraw_spot(
+                    &pair.base.to_uppercase(),
+                    address,
+                    pending.base_amount,
+                    network,
+                    memo,
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    pair = %state.pair_label,
+                    base = pending.base_amount,
+                    error = %err,
+                    "cex withdraw for base asset failed"
+                );
+                success = false;
+            }
+        }
+
+        if pending.quote_amount > 0.0 {
+            if let Err(err) = executor
+                .withdraw_spot(
+                    &pair.quote.to_uppercase(),
+                    address,
+                    pending.quote_amount,
+                    network,
+                    memo,
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    pair = %state.pair_label,
+                    quote = pending.quote_amount,
+                    error = %err,
+                    "cex withdraw for quote asset failed"
+                );
+                success = false;
+            }
+        }
+
+        if success {
+            state.last_rebalance_at = Some(now);
+            info!(
+                pair = %state.pair_label,
+                base = pending.base_amount,
+                quote = pending.quote_amount,
+                notional = pending.notional,
+                "completed cex to dex rebalance"
+            );
+        } else {
+            state.pending_to_dex_mut().add(
+                pending.base_amount,
+                pending.quote_amount,
+                pending.notional,
+            );
+            state.last_rebalance_at = Some(now);
+        }
+
+        state.resume();
+        Ok(())
+    }
+
+    async fn transfer_to_cex(
+        &self,
+        pair_label: &str,
+        base_amount: f64,
+        quote_amount: f64,
+    ) -> Result<()> {
+        if base_amount <= f64::EPSILON && quote_amount <= f64::EPSILON {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "dex->cex transfer for {pair_label} not implemented (base={base_amount}, quote={quote_amount})"
+        );
+    }
+
     async fn rebalance_lending(&self) -> Result<()> {
         let health = self.lending.account_health().await?;
-        let max_ratio = health.max_borrow_ratio;
-        let repay_threshold = health.repay_threshold_ratio;
-        let desired_ratio = if max_ratio > 0.0 { max_ratio } else { 0.5 };
-        let borrow_floor = if desired_ratio > 0.1 {
-            (desired_ratio - 0.1).max(0.0)
-        } else {
-            desired_ratio * 0.8
-        };
-        let borrow_floor = borrow_floor.min(desired_ratio);
-        let adjustment = self.params.max_order_size.max(1.0) * 0.25;
+        self.record_spot_withdrawal_probe(health.borrow_ratio);
 
-        if health.borrow_ratio > repay_threshold {
+        if health.borrow_ratio >= self.borrow_alert_ratio {
             self.risk
-                .borrow_health(health.borrow_ratio, repay_threshold)
+                .borrow_health(health.borrow_ratio, self.borrow_alert_ratio)
                 .await;
             info!(
                 borrow_ratio = health.borrow_ratio,
-                repay_threshold, "borrow ratio above threshold; triggering repay"
+                alert_ratio = self.borrow_alert_ratio,
+                target_ratio = self.borrow_target_ratio,
+                "borrow ratio above alert; repaying to target"
             );
-            self.lending.repay_asset(adjustment).await?;
-        } else if health.borrow_ratio < borrow_floor {
-            // 默认保持在约 50% 抵押率（max_ratio），低于约 40% 时补充借款。
+            self.lending
+                .repay_to_target(self.borrow_target_ratio)
+                .await?;
+            return Ok(());
+        }
+
+        if health.borrow_ratio + 1e-6 < self.borrow_target_ratio {
+            let adjustment = self.params.max_order_size.max(1.0) * 0.25;
             info!(
                 borrow_ratio = health.borrow_ratio,
-                desired_ratio,
-                borrow_floor,
-                "borrow ratio below lower bound; borrowing to restore balance"
+                target_ratio = self.borrow_target_ratio,
+                "borrow ratio below target; borrowing to restore balance"
             );
             self.lending.borrow_asset(adjustment).await?;
         }
@@ -472,6 +867,22 @@ impl StrategyEngine {
         let borrow_amount = self.params.max_order_size * 0.25;
         self.lending.borrow_asset(borrow_amount).await?;
         Ok(())
+    }
+
+    fn record_spot_withdrawal_probe(&self, borrow_ratio: f64) {
+        let threshold = self.params.spot_withdraw_threshold;
+        // TODO: 在接入 CEX 余额查询后改为比较实际现货库存比例，并触发自动提现。
+        match threshold {
+            Some(value) => info!(
+                borrow_ratio,
+                threshold_bps = value,
+                "recording spot withdrawal probe"
+            ),
+            None => info!(
+                borrow_ratio,
+                "spot withdrawal threshold not configured; probe logged for observability"
+            ),
+        }
     }
 }
 
@@ -501,6 +912,7 @@ struct StrategyParams {
     cex_volatility_bps: f64,
     rebid_threshold_bps: f64,
     ladder_levels: usize,
+    spot_withdraw_threshold: Option<f64>,
 }
 
 impl StrategyParams {
@@ -524,6 +936,7 @@ impl StrategyParams {
             cex_volatility_bps,
             rebid_threshold_bps,
             ladder_levels: LADDER_LEVELS,
+            spot_withdraw_threshold: resolve_spot_withdraw_threshold(strategy),
         }
     }
 }
@@ -538,6 +951,10 @@ struct StrategyPairState {
     reference_mid: Option<f64>,
     volatility_mid: Option<f64>,
     orders: Vec<ActiveOrder>,
+    pending_to_cex: PendingTransfer,
+    pending_to_dex: PendingTransfer,
+    last_rebalance_at: Option<Instant>,
+    suspended: bool,
 }
 
 impl StrategyPairState {
@@ -552,6 +969,10 @@ impl StrategyPairState {
             reference_mid: None,
             volatility_mid: None,
             orders: Vec::new(),
+            pending_to_cex: PendingTransfer::default(),
+            pending_to_dex: PendingTransfer::default(),
+            last_rebalance_at: None,
+            suspended: false,
         }
     }
 
@@ -612,11 +1033,49 @@ impl StrategyPairState {
         !self.orders.is_empty()
     }
 
+    fn is_suspended(&self) -> bool {
+        self.suspended
+    }
+
+    fn suspend(&mut self) {
+        self.suspended = true;
+    }
+
+    fn resume(&mut self) {
+        self.suspended = false;
+    }
+
+    fn pending_to_cex(&self) -> &PendingTransfer {
+        &self.pending_to_cex
+    }
+
+    fn pending_to_dex(&self) -> &PendingTransfer {
+        &self.pending_to_dex
+    }
+
+    fn pending_to_cex_mut(&mut self) -> &mut PendingTransfer {
+        &mut self.pending_to_cex
+    }
+
+    fn pending_to_dex_mut(&mut self) -> &mut PendingTransfer {
+        &mut self.pending_to_dex
+    }
+
+    fn take_pending_to_cex(&mut self) -> PendingTransfer {
+        mem::take(&mut self.pending_to_cex)
+    }
+
+    fn take_pending_to_dex(&mut self) -> PendingTransfer {
+        mem::take(&mut self.pending_to_dex)
+    }
+
     fn add_order(&mut self, level: usize, side: MarketSide, snapshot: OrderSnapshot) {
+        let last_reported = snapshot.filled_base;
         self.orders.push(ActiveOrder {
             level,
             side,
             snapshot,
+            last_reported_base: last_reported,
         });
     }
 
@@ -645,6 +1104,7 @@ struct ActiveOrder {
     level: usize,
     side: MarketSide,
     snapshot: OrderSnapshot,
+    last_reported_base: f64,
 }
 
 #[derive(Clone)]
@@ -658,6 +1118,31 @@ struct DesiredOrder {
 impl DesiredOrder {
     fn matches(&self, order: &ActiveOrder) -> bool {
         self.level == order.level && self.side == order.side
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct PendingTransfer {
+    notional: f64,
+    base_amount: f64,
+    quote_amount: f64,
+}
+
+impl PendingTransfer {
+    fn add(&mut self, base: f64, quote: f64, notional: f64) {
+        if base > 0.0 {
+            self.base_amount += base;
+        }
+        if quote > 0.0 {
+            self.quote_amount += quote;
+        }
+        if notional > 0.0 {
+            self.notional += notional;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.notional <= f64::EPSILON
     }
 }
 
@@ -720,6 +1205,43 @@ fn price_diff_bps(a: f64, b: f64) -> f64 {
     ((a - b).abs() / b) * 10_000.0
 }
 
+fn resolve_spot_withdraw_threshold(config: &StrategyConfig) -> Option<f64> {
+    if let Ok(value) = std::env::var(SPOT_WITHDRAW_THRESHOLD_ENV) {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        match trimmed.parse::<f64>() {
+            Ok(parsed) if parsed >= 0.0 => return Some(parsed),
+            Ok(parsed) => {
+                warn!(
+                    env = SPOT_WITHDRAW_THRESHOLD_ENV,
+                    parsed, "ignoring negative spot withdraw threshold"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    env = SPOT_WITHDRAW_THRESHOLD_ENV,
+                    error = %err,
+                    raw = trimmed,
+                    "failed to parse spot withdraw threshold from env"
+                );
+            }
+        }
+    }
+    match config.spot_withdraw_threshold_bps {
+        Some(value) if value >= 0.0 => Some(value),
+        Some(value) => {
+            warn!(
+                config_value = value,
+                "ignoring negative spot withdraw threshold from config"
+            );
+            None
+        }
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,6 +1298,7 @@ mod tests {
                 created_at: std::time::SystemTime::now(),
                 updated_at: std::time::SystemTime::now(),
             },
+            last_reported_base: 0.0,
         };
         let desired = DesiredOrder {
             level: 1,
@@ -809,6 +1332,7 @@ mod tests {
             LendingClient::from_config(&config),
             order_tx,
             Arc::clone(&health),
+            None,
         );
 
         let mut state = StrategyPairState::new("WAL/USDC".into());
@@ -849,6 +1373,7 @@ mod tests {
             LendingClient::from_config(&config),
             order_tx,
             Arc::clone(&health),
+            None,
         );
 
         let mut state = StrategyPairState::new("WAL/USDC".into());

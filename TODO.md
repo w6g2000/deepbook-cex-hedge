@@ -29,17 +29,20 @@
 - [x] 为每档挂单记录 CEX 基准价，价差超阈值（ `rebid_threshold_bps` ）时自动撤单并重新挂单，防止频繁刷新
 - [x] 定期监控借贷健康度，超过 `repay_threshold_ratio` 时触发部分还款，维持抵押占用在安全范围
 - [x] Deepbook 成交后：轮询/监听确认 → claim 代币与剩余 USDC → 重新平衡 CEX/链上资金 → 下发下一轮挂单任务
+- [ ] 将借贷再平衡改为“成交事件触发 + 低频定时兜底”的组合模式，加入防抖逻辑避免高频借还
 
 ## Phase 5 – CEX 执行与仓位管理
 - [x] 新建 `CexExecutor` trait + Binance 永续实现（下单/撤单/查询仓位）
 - [x] 建 `PositionManager` 追踪 CEX 对冲仓位、PnL、剩余头寸
 - [x] 实现“链上先出再平仓”流程：策略发出回补信号 → Deepbook 平仓 → 成功后平掉 CEX
 - [x] 处理部分成交/滑点，必要时调整仓位
+- [ ] 查询 Binance 现货余额并与链上资产估值对比，结合 `SPOT_WITHDRAW_THRESHOLD_BPS` 做库存再平衡决策
+- [ ] 扩展 `CexExecutor` 支持 `withdraw_spot`，串联 Binance 现货提现 API 与失败重试
 
 ## Phase 6 – 风控 & 报警
 - [x] 实现价格突变报警：监控 CEX 秒级涨跌幅，超过阈值撤空 Deepbook 挂单、暂停策略
 - [x] 实现深度不足报警：当所需数量对应深度 < 阈值时禁用新挂单
-- [x] 监控借贷健康度、CEX 爆仓价、未平仓数量，超过阈值触发 `RiskAction`
+- [x] 监控借贷健康度、CEX 爆仓价、未平仓数量，超过阈值触发 `RiskAction`/s
 - [x] 集成通知通道（占位：日志/HTTP 等）
 
 ## Phase 7 – 运行时与退出流程

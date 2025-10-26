@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use dotenvy::dotenv;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,9 @@ pub struct AppConfig {
     /// 程序优雅退出时的时间控制。
     #[serde(default)]
     pub shutdown: ShutdownConfig,
+    /// 跨 venue 库存搬运与借贷联动的参数。
+    #[serde(default)]
+    pub rebalance: RebalanceConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -114,6 +118,98 @@ pub struct LendingConfig {
     pub max_borrow_ratio: Option<f64>,
     /// 达到该比例时触发归还借款的阈值。
     pub repay_threshold_ratio: Option<f64>,
+    /// Navi 链上交互所需的详细参数。
+    #[serde(default)]
+    pub navi: Option<NaviLendingConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct NaviLendingConfig {
+    /// Sui RPC 节点地址。
+    pub rpc_endpoint: Option<String>,
+    /// 存放 Navi 签名私钥的环境变量名。
+    #[serde(default = "default_navi_signer_env")]
+    pub signer_env: String,
+    /// Navi entry_deposit 所在的 package id。
+    pub package_id: Option<String>,
+    /// 调用的模块名称，默认 `incentive_v3`。
+    #[serde(default = "default_navi_module")]
+    pub module: String,
+    /// 调用的函数名称，默认 `entry_deposit`。
+    #[serde(default = "default_navi_function")]
+    pub function: String,
+    /// 质押资产的 Move 类型。
+    #[serde(default = "default_navi_coin_type")]
+    pub coin_type: String,
+    /// 质押资产的小数位数，默认 6（USDC）。
+    #[serde(default = "default_usdc_decimals")]
+    pub coin_decimals: u8,
+    /// Navi 合约定义的 asset id。
+    #[serde(default = "default_navi_asset_id")]
+    pub asset_id: u8,
+    /// Navi 提供的 UI Getter 包地址，若未配置则通过 OpenAPI 获取。
+    #[serde(default)]
+    pub ui_getter_package: Option<String>,
+    /// Navi OpenAPI 基础地址。
+    #[serde(default = "default_navi_api_base_url")]
+    pub api_base_url: String,
+    /// Navi OpenAPI 环境标识，例如 `prod`。
+    #[serde(default = "default_navi_api_env")]
+    pub api_env: String,
+    /// Sui Clock 对象。
+    #[serde(default)]
+    pub clock: Option<SharedObjectConfig>,
+    /// Navi Storage 对象。
+    #[serde(default)]
+    pub storage: Option<SharedObjectConfig>,
+    /// Navi Pool 对象。
+    #[serde(default)]
+    pub pool: Option<SharedObjectConfig>,
+    /// Incentive V2 对象。
+    #[serde(default)]
+    pub incentive_v2: Option<SharedObjectConfig>,
+    /// Incentive V3 对象。
+    #[serde(default)]
+    pub incentive_v3: Option<SharedObjectConfig>,
+    /// 交易 gas budget。
+    #[serde(default = "default_navi_gas_budget")]
+    pub gas_budget: u64,
+}
+
+fn default_navi_signer_env() -> String {
+    "NAVI_SIGNER_KEY".to_string()
+}
+
+fn default_navi_module() -> String {
+    "incentive_v3".to_string()
+}
+
+fn default_navi_function() -> String {
+    "entry_deposit".to_string()
+}
+
+fn default_navi_coin_type() -> String {
+    "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC".to_string()
+}
+
+fn default_usdc_decimals() -> u8 {
+    6
+}
+
+fn default_navi_asset_id() -> u8 {
+    10
+}
+
+fn default_navi_api_base_url() -> String {
+    "https://open-api.naviprotocol.io".to_string()
+}
+
+fn default_navi_api_env() -> String {
+    "prod".to_string()
+}
+
+fn default_navi_gas_budget() -> u64 {
+    50_000_000
 }
 
 fn default_binance_api_key_env() -> String {
@@ -137,6 +233,9 @@ pub struct ContractsConfig {
     /// DeepBook 链上执行相关合约配置。
     #[serde(default)]
     pub deepbook_execution: Option<DeepbookExecutionContracts>,
+    /// Navi 质押/借贷对象配置。
+    #[serde(default)]
+    pub lending_navi: Option<NaviLendingConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -186,6 +285,9 @@ impl ContractsConfig {
         if let Some(value) = other.deepbook_execution {
             self.deepbook_execution = Some(value);
         }
+        if let Some(value) = other.lending_navi {
+            self.lending_navi = Some(value);
+        }
     }
 }
 
@@ -199,6 +301,8 @@ pub struct StrategyConfig {
     pub cex_volatility_bps: Option<f64>,
     /// CEX 价格变化低于该阈值时不重新挂单。
     pub rebid_threshold_bps: Option<f64>,
+    /// Binance 现货提现触发阈值（基点）。可被环境变量 `SPOT_WITHDRAW_THRESHOLD_BPS` 覆盖。
+    pub spot_withdraw_threshold_bps: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -209,6 +313,88 @@ pub struct ShutdownConfig {
     pub repay_timeout_ms: Option<u64>,
     /// 平掉对冲仓位操作的超时时间（毫秒）。
     pub close_hedge_timeout_ms: Option<u64>,
+}
+
+const DEFAULT_REBALANCE_MIN_NOTIONAL_USD: f64 = 50.0;
+const DEFAULT_REBALANCE_COOLDOWN_SECS: u64 = 60;
+const DEFAULT_BORROW_ALERT_RATIO: f64 = 0.6;
+const DEFAULT_BORROW_TARGET_RATIO: f64 = 0.5;
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RebalanceConfig {
+    #[serde(default)]
+    pub min_notional_usd: Option<f64>,
+    #[serde(default)]
+    pub cooldown_secs: Option<u64>,
+    #[serde(default)]
+    pub deposit_address: Option<String>,
+    #[serde(default)]
+    pub deposit_network: Option<String>,
+    #[serde(default)]
+    pub deposit_memo: Option<String>,
+    #[serde(default)]
+    pub borrow_alert_ratio: Option<f64>,
+    #[serde(default)]
+    pub borrow_target_ratio: Option<f64>,
+}
+
+impl Default for RebalanceConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl RebalanceConfig {
+    pub fn from_env() -> Self {
+        let _ = dotenv();
+        Self {
+            min_notional_usd: read_env_f64("REBALANCE_MIN_NOTIONAL_USD"),
+            cooldown_secs: read_env_u64("REBALANCE_COOLDOWN_SECS"),
+            deposit_address: read_env_string("CEX_DEPOSIT_ADDRESS"),
+            deposit_network: read_env_string("CEX_DEPOSIT_NETWORK"),
+            deposit_memo: read_env_string("CEX_DEPOSIT_MEMO"),
+            borrow_alert_ratio: read_env_f64("LENDING_BORROW_RATIO_ALERT"),
+            borrow_target_ratio: read_env_f64("LENDING_BORROW_RATIO_TARGET"),
+        }
+    }
+
+    pub fn min_notional(&self) -> f64 {
+        self.min_notional_usd
+            .filter(|value| *value > 0.0)
+            .unwrap_or(DEFAULT_REBALANCE_MIN_NOTIONAL_USD)
+    }
+
+    pub fn cooldown_secs(&self) -> u64 {
+        self.cooldown_secs
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_REBALANCE_COOLDOWN_SECS)
+    }
+
+    pub fn borrow_alert_ratio(&self) -> f64 {
+        self.borrow_alert_ratio
+            .filter(|value| *value > 0.0)
+            .unwrap_or(DEFAULT_BORROW_ALERT_RATIO)
+    }
+
+    pub fn borrow_target_ratio(&self) -> f64 {
+        self.borrow_target_ratio
+            .filter(|value| *value > 0.0)
+            .unwrap_or(DEFAULT_BORROW_TARGET_RATIO)
+    }
+}
+
+fn read_env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn read_env_f64(name: &str) -> Option<f64> {
+    read_env_string(name)?.parse::<f64>().ok()
+}
+
+fn read_env_u64(name: &str) -> Option<u64> {
+    read_env_string(name)?.parse::<u64>().ok()
 }
 
 impl AppConfig {
@@ -233,6 +419,9 @@ impl AppConfig {
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
         if let Some(overrides) = load_contracts_override(path)? {
             cfg.contracts.merge(overrides);
+        }
+        if cfg.contracts.lending_navi.is_some() {
+            cfg.lending.navi = cfg.contracts.lending_navi.clone();
         }
         Ok(cfg)
     }
