@@ -1,7 +1,7 @@
 //! 手动运行的链上质押冒烟测试。
 //!
 //! 运行前准备：
-//! 1. `.env` 中提供 `NAVI_SIGNER_KEY`、Sui RPC 及 `config/app.toml` 内的 `[lending.navi]` 参数。
+//! 1. `.env` 中提供 `HEDGE_SIGNER_KEY`、Sui RPC 及 `config/app.toml` 内的 `[lending.navi]` 参数。
 //! 2. 账号需持有足够 SUI 作为 gas 以及待质押的 USDC。
 //!
 //! 执行命令示例：
@@ -12,32 +12,40 @@
 use anyhow::{Context, Result, anyhow, bail};
 use lending::LendingClient;
 use shared::config::AppConfig;
+use shared::types::NaviAssetId;
 use std::sync::Once;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_DEPOSIT_AMOUNT: f64 = 0.000001;
 
-fn tracked_assets(config: &AppConfig) -> Vec<u8> {
-    let mut assets = vec![0u8, 24u8];
+fn tracked_assets(config: &AppConfig) -> Vec<NaviAssetId> {
+    let mut assets = vec![NaviAssetId::Sui, NaviAssetId::Wal];
     if let Some(navi) = &config.lending.navi {
-        if !assets.contains(&navi.asset_id) {
-            assets.push(navi.asset_id);
+        for asset in [navi.asset_id, navi.borrow_asset_id] {
+            if !assets.contains(&asset) {
+                assets.push(asset);
+            }
         }
     }
     assets
 }
 
-fn asset_decimals(config: &AppConfig, asset_id: u8) -> u8 {
-    if asset_id == 0 {
-        9
-    } else {
-        config
+fn asset_decimals(config: &AppConfig, asset_id: NaviAssetId) -> u8 {
+    match asset_id {
+        NaviAssetId::Sui => 9,
+        NaviAssetId::Usdc => config
             .lending
             .navi
             .as_ref()
             .map(|cfg| cfg.coin_decimals)
-            .unwrap_or(6)
+            .unwrap_or(6),
+        NaviAssetId::Wal => config
+            .lending
+            .navi
+            .as_ref()
+            .map(|cfg| cfg.borrow_coin_decimals)
+            .unwrap_or(9),
     }
 }
 
@@ -63,7 +71,7 @@ async fn deposit_collateral_onchain_smoke() -> Result<()> {
     let app_config_path = manifest.join("../../config/app.toml");
 
     // 确认关键环境变量已配置。
-    std::env::var("NAVI_SIGNER_KEY").context("NAVI_SIGNER_KEY 未设置，无法执行链上质押测试")?;
+    std::env::var("HEDGE_SIGNER_KEY").context("HEDGE_SIGNER_KEY 未设置，无法执行链上质押测试")?;
 
     let amount = std::env::var("NAVI_TEST_DEPOSIT")
         .ok()
@@ -118,6 +126,7 @@ async fn deposit_collateral_onchain_smoke() -> Result<()> {
     }
 
     for asset_id in tracked {
+        let asset_numeric = asset_id.as_u8();
         if let Some(balance) = client.navi_user_balance(asset_id).await? {
             let decimals = asset_decimals(&config, asset_id);
             let supplied_shares = balance
@@ -147,7 +156,8 @@ async fn deposit_collateral_onchain_smoke() -> Result<()> {
                 .map(|d| d.normalize().to_string())
                 .unwrap_or_else(|| "N/A".to_string());
             info!(
-                asset_id,
+                asset = %asset_id,
+                asset_id = asset_numeric,
                 decimals,
                 supplied_shares_raw = %balance.supplied_shares,
                 borrowed_shares_raw = %balance.borrowed_shares,
@@ -162,7 +172,7 @@ async fn deposit_collateral_onchain_smoke() -> Result<()> {
                 "ui_getter::get_user_state 返回数据"
             );
         } else {
-            info!(asset_id, "ui_getter::get_user_state 未返回记录");
+            info!(asset = %asset_id, asset_id = asset_numeric, "ui_getter::get_user_state 未返回记录");
         }
     }
 
@@ -178,7 +188,7 @@ async fn fetch_user_assets_devinspect() -> Result<()> {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let app_config_path = manifest.join("../../config/app.toml");
 
-    std::env::var("NAVI_SIGNER_KEY").context("NAVI_SIGNER_KEY 未设置，无法执行链上查询测试")?;
+    std::env::var("HEDGE_SIGNER_KEY").context("HEDGE_SIGNER_KEY 未设置，无法执行链上查询测试")?;
 
     let config = AppConfig::load_from_path(&app_config_path)
         .with_context(|| format!("加载应用配置 {:?} 失败", app_config_path))?;
@@ -204,6 +214,7 @@ async fn fetch_user_assets_devinspect() -> Result<()> {
     }
 
     for asset_id in tracked_assets(&config) {
+        let asset_numeric = asset_id.as_u8();
         if let Some(balance) = client.navi_user_balance(asset_id).await? {
             let decimals = asset_decimals(&config, asset_id);
             let supplied_real = balance
@@ -215,7 +226,8 @@ async fn fetch_user_assets_devinspect() -> Result<()> {
                 .map(|d| d.normalize().to_string())
                 .unwrap_or_else(|| "N/A".to_string());
             info!(
-                asset_id,
+                asset = %asset_id,
+                asset_id = asset_numeric,
                 decimals,
                 supplied_shares_raw = %balance.supplied_shares,
                 borrowed_shares_raw = %balance.borrowed_shares,
@@ -226,7 +238,7 @@ async fn fetch_user_assets_devinspect() -> Result<()> {
                 "ui_getter::get_user_state 返回数据"
             );
         } else {
-            info!(asset_id, "ui_getter::get_user_state 未返回记录");
+            info!(asset = %asset_id, asset_id = asset_numeric, "ui_getter::get_user_state 未返回记录");
         }
     }
     Ok(())

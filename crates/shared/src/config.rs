@@ -1,3 +1,4 @@
+use crate::types::NaviAssetId;
 use anyhow::{Context, Result};
 use dotenvy::dotenv;
 use serde::Deserialize;
@@ -138,6 +139,15 @@ pub struct NaviLendingConfig {
     /// 调用的函数名称，默认 `entry_deposit`。
     #[serde(default = "default_navi_function")]
     pub function: String,
+    /// 调用的提现函数名称，默认 `withdraw`。
+    #[serde(default = "default_navi_withdraw_function")]
+    pub withdraw_function: String,
+    /// 调用的借款函数名称，默认 `borrow`。
+    #[serde(default = "default_navi_borrow_function")]
+    pub borrow_function: String,
+    /// 调用的还款函数名称，默认 `entry_repay`。
+    #[serde(default = "default_navi_repay_function")]
+    pub repay_function: String,
     /// 质押资产的 Move 类型。
     #[serde(default = "default_navi_coin_type")]
     pub coin_type: String,
@@ -145,8 +155,17 @@ pub struct NaviLendingConfig {
     #[serde(default = "default_usdc_decimals")]
     pub coin_decimals: u8,
     /// Navi 合约定义的 asset id。
-    #[serde(default = "default_navi_asset_id")]
-    pub asset_id: u8,
+    #[serde(default)]
+    pub asset_id: NaviAssetId,
+    /// 借款资产的 Move 类型。
+    #[serde(default = "default_navi_borrow_coin_type")]
+    pub borrow_coin_type: String,
+    /// 借款资产的小数位数，默认 9（WAL）。
+    #[serde(default = "default_wal_decimals")]
+    pub borrow_coin_decimals: u8,
+    /// Navi 合约定义的借款资产 ID。
+    #[serde(default = "default_navi_borrow_asset_id")]
+    pub borrow_asset_id: NaviAssetId,
     /// Navi 提供的 UI Getter 包地址，若未配置则通过 OpenAPI 获取。
     #[serde(default)]
     pub ui_getter_package: Option<String>,
@@ -165,6 +184,15 @@ pub struct NaviLendingConfig {
     /// Navi Pool 对象。
     #[serde(default)]
     pub pool: Option<SharedObjectConfig>,
+    /// 抵押资产（例如 USDC）对应的 Pool 对象。
+    #[serde(default)]
+    pub collateral_pool: Option<SharedObjectConfig>,
+    /// 借款资产（例如 WAL）对应的 Pool 对象。
+    #[serde(default)]
+    pub borrow_pool: Option<SharedObjectConfig>,
+    /// 价格预言机对象。
+    #[serde(default)]
+    pub oracle: Option<SharedObjectConfig>,
     /// Incentive V2 对象。
     #[serde(default)]
     pub incentive_v2: Option<SharedObjectConfig>,
@@ -177,7 +205,7 @@ pub struct NaviLendingConfig {
 }
 
 fn default_navi_signer_env() -> String {
-    "NAVI_SIGNER_KEY".to_string()
+    "HEDGE_SIGNER_KEY".to_string()
 }
 
 fn default_navi_module() -> String {
@@ -188,6 +216,18 @@ fn default_navi_function() -> String {
     "entry_deposit".to_string()
 }
 
+fn default_navi_borrow_function() -> String {
+    "borrow".to_string()
+}
+
+fn default_navi_repay_function() -> String {
+    "entry_repay".to_string()
+}
+
+fn default_navi_withdraw_function() -> String {
+    "withdraw".to_string()
+}
+
 fn default_navi_coin_type() -> String {
     "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC".to_string()
 }
@@ -196,8 +236,16 @@ fn default_usdc_decimals() -> u8 {
     6
 }
 
-fn default_navi_asset_id() -> u8 {
-    10
+fn default_navi_borrow_coin_type() -> String {
+    "0x356a26eb9e012a68958082340d4c4116e7f55615cf27affcff209cf0ae544f59::wal::WAL".to_string()
+}
+
+fn default_wal_decimals() -> u8 {
+    9
+}
+
+fn default_navi_borrow_asset_id() -> NaviAssetId {
+    NaviAssetId::Wal
 }
 
 fn default_navi_api_base_url() -> String {
@@ -467,7 +515,7 @@ fn load_contracts_override(app_config_path: &Path) -> Result<Option<ContractsCon
 }
 
 fn default_signer_env() -> String {
-    "DEEPBOOK_PRIVATE_KEY".to_string()
+    "HEDGE_SIGNER_KEY".to_string()
 }
 
 impl DeepbookConfig {

@@ -2,11 +2,13 @@ pub mod constants;
 mod error;
 mod onchain;
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use constants::{BORROW_SYMBOL, COLLATERAL_SYMBOL};
 use error::LendingError;
 use onchain::NaviOnchainClient;
+use rust_decimal::prelude::ToPrimitive;
 use shared::config::{AppConfig, LendingConfig, NaviLendingConfig};
+use shared::types::NaviAssetId;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, info, warn};
@@ -118,7 +120,10 @@ impl LendingClient {
     }
 
     /// 查询指定资产 ID 的抵押/借款余额。
-    pub async fn navi_user_balance(&self, asset_id: u8) -> Result<Option<NaviAssetBalance>> {
+    pub async fn navi_user_balance(
+        &self,
+        asset_id: NaviAssetId,
+    ) -> Result<Option<NaviAssetBalance>> {
         if let Some(client) = self.onchain_client().await? {
             let balance = client.fetch_user_balance(asset_id).await?;
             return Ok(Some(balance));
@@ -140,64 +145,126 @@ impl LendingClient {
         asset_symbol: Option<&str>,
     ) -> Result<BorrowReceipt> {
         ensure_positive(amount)?;
-        let (projected_ratio, max_ratio) = {
-            let mut state = self.state.lock().await;
-            state.borrowed_value += amount;
-            let collateral = state.collateral_value;
-            let ratio = if collateral <= f64::EPSILON {
-                f64::INFINITY
-            } else {
-                state.borrowed_value / collateral
-            };
-            (
-                ratio,
-                self.config
-                    .max_borrow_ratio
-                    .unwrap_or(DEFAULT_MAX_BORROW_RATIO),
-            )
+        let symbol = asset_symbol
+            .and_then(|s| {
+                let trimmed = s.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+            .or_else(|| self.borrow_symbol.clone());
+        let asset_label = symbol.as_deref().unwrap_or("N/A");
+
+        let (collateral, borrowed) = {
+            let state = self.state.lock().await;
+            (state.collateral_value, state.borrowed_value)
         };
+        let projected = borrowed + amount;
+        let projected_ratio = if collateral <= f64::EPSILON {
+            f64::INFINITY
+        } else {
+            projected / collateral
+        };
+        let max_ratio = self
+            .config
+            .max_borrow_ratio
+            .unwrap_or(DEFAULT_MAX_BORROW_RATIO);
         if projected_ratio.is_infinite() || projected_ratio > max_ratio {
             warn!(
                 projected_ratio,
                 max_ratio,
                 amount,
-                asset = asset_symbol.unwrap_or("N/A"),
+                asset = asset_label,
                 "borrow amount pushes ratio above configured maximum"
             );
         }
+
+        let onchain_client = self.onchain_client().await?;
+        let mut tx_digest = None;
+
+        if let Some(client) = onchain_client.as_ref() {
+            let response = client.borrow(amount).await?;
+            tx_digest = Some(response.digest.to_string());
+        }
+
+        let updated_ratio = {
+            let mut state = self.state.lock().await;
+            state.borrowed_value += amount;
+            if state.collateral_value <= f64::EPSILON {
+                f64::INFINITY
+            } else {
+                state.borrowed_value / state.collateral_value
+            }
+        };
+
         info!(
             amount,
-            asset = asset_symbol.unwrap_or("N/A"),
-            "borrow asset stub invoked"
+            asset = asset_label,
+            projected_ratio,
+            borrow_ratio = updated_ratio,
+            onchain = tx_digest.is_some(),
+            tx_digest = tx_digest.as_deref().unwrap_or(""),
+            "borrow asset processed"
         );
-        Ok(BorrowReceipt::placeholder(amount, asset_symbol))
+
+        let symbol_str = symbol.as_deref();
+        let receipt = if let Some(ref digest) = tx_digest {
+            BorrowReceipt::onchain(amount, symbol_str, digest.clone())
+        } else {
+            BorrowReceipt::placeholder(amount, symbol_str)
+        };
+        Ok(receipt)
     }
 
     /// 归还借出的代币。
     pub async fn repay_asset(&self, amount: f64) -> Result<()> {
         ensure_positive(amount)?;
-        let (repay_actual, remaining) = {
-            let mut state = self.state.lock().await;
-            if state.borrowed_value <= f64::EPSILON {
-                (0.0, 0.0)
-            } else {
-                let repay = amount.min(state.borrowed_value);
-                state.borrowed_value -= repay;
-                (repay, state.borrowed_value)
-            }
+        let onchain_cfg = match (&self.onchain_config, self.onchain_client().await?) {
+            (Some(cfg), Some(client)) => Some((cfg.clone(), client)),
+            _ => None,
         };
-        if repay_actual <= f64::EPSILON {
+
+        let outstanding = if let Some((cfg, client)) = &onchain_cfg {
+            let balance = client.fetch_user_balance(cfg.borrow_asset_id).await?;
+            balance
+                .borrowed_amount_decimal(cfg.borrow_coin_decimals)
+                .and_then(|d| d.to_f64())
+                .unwrap_or(0.0)
+        } else {
+            let state = self.state.lock().await;
+            state.borrowed_value
+        };
+
+        if outstanding <= f64::EPSILON {
             warn!(
                 amount,
                 "repay request ignored because outstanding borrow is zero"
             );
             return Ok(());
         }
+
+        let repay_target = if onchain_cfg.is_some() {
+            amount
+        } else {
+            amount.min(outstanding)
+        };
+
+        let actual_repay = repay_target.min(outstanding);
+
+        if let Some((_, client)) = onchain_cfg.clone() {
+            client.repay(repay_target).await?;
+        }
+        let remaining = {
+            let mut state = self.state.lock().await;
+            let updated = (outstanding - actual_repay).max(0.0);
+            state.borrowed_value = updated;
+            updated
+        };
         info!(
-            amount = repay_actual,
+            amount = repay_target,
+            repaid = actual_repay,
             remaining = remaining.max(0.0),
             asset = self.borrow_symbol.as_deref().unwrap_or("N/A"),
-            "repay asset stub invoked"
+            onchain = self.onchain_config.is_some(),
+            "repay asset processed"
         );
         Ok(())
     }
@@ -249,21 +316,59 @@ impl LendingClient {
     /// 撤回多余抵押物（如未使用的 USDC）。
     pub async fn withdraw_collateral(&self, amount: f64) -> Result<()> {
         ensure_positive(amount)?;
+        let onchain_ctx = match (&self.onchain_config, self.onchain_client().await?) {
+            (Some(cfg), Some(client)) => Some((cfg.clone(), client)),
+            _ => None,
+        };
+
+        let available = if let Some((cfg, client)) = &onchain_ctx {
+            let balance = client.fetch_user_balance(cfg.asset_id).await?;
+            balance
+                .supplied_amount_decimal(cfg.coin_decimals)
+                .and_then(|d| d.to_f64())
+                .unwrap_or(0.0)
+        } else {
+            let state = self.state.lock().await;
+            state.collateral_value
+        };
+
+        if available <= f64::EPSILON {
+            bail!("collateral balance is zero; cannot withdraw");
+        }
+        ensure!(
+            amount <= available + f64::EPSILON,
+            "withdraw amount {amount} exceeds collateral balance {available}"
+        );
+
+        let mut tx_digest = None;
+        if let Some((_, client)) = &onchain_ctx {
+            let response = client.withdraw(amount).await?;
+            tx_digest = Some(response.digest.to_string());
+        }
+
         let total_after = {
             let mut state = self.state.lock().await;
-            ensure!(
-                amount <= state.collateral_value + f64::EPSILON,
-                "withdraw amount {amount} exceeds collateral balance {}",
+            if onchain_ctx.is_some() {
+                let updated = (available - amount).max(0.0);
+                state.collateral_value = updated;
+                updated
+            } else {
+                ensure!(
+                    amount <= state.collateral_value + f64::EPSILON,
+                    "withdraw amount {amount} exceeds collateral balance {}",
+                    state.collateral_value
+                );
+                state.collateral_value = (state.collateral_value - amount).max(0.0);
                 state.collateral_value
-            );
-            state.collateral_value = (state.collateral_value - amount).max(0.0);
-            state.collateral_value
+            }
         };
         info!(
             amount,
             collateral = %self.collateral_symbol,
             remaining_collateral = total_after,
-            "withdraw collateral stub invoked"
+            onchain = onchain_ctx.is_some(),
+            tx_digest = tx_digest.as_deref().unwrap_or(""),
+            "withdraw collateral processed"
         );
         Ok(())
     }
@@ -329,6 +434,7 @@ pub struct BorrowReceipt {
     pub amount: f64,
     pub ticket_id: Option<String>,
     pub asset_symbol: Option<String>,
+    pub tx_digest: Option<String>,
 }
 
 impl BorrowReceipt {
@@ -337,6 +443,16 @@ impl BorrowReceipt {
             amount,
             ticket_id: None,
             asset_symbol: asset_symbol.map(|s| s.to_string()),
+            tx_digest: None,
+        }
+    }
+
+    pub fn onchain(amount: f64, asset_symbol: Option<&str>, tx_digest: impl Into<String>) -> Self {
+        Self {
+            amount,
+            ticket_id: None,
+            asset_symbol: asset_symbol.map(|s| s.to_string()),
+            tx_digest: Some(tx_digest.into()),
         }
     }
 }
@@ -381,6 +497,7 @@ mod tests {
         let receipt = client.borrow_asset(50.0).await.expect("borrow");
         assert_eq!(receipt.amount, 50.0);
         assert_eq!(receipt.asset_symbol.as_deref(), Some("WAL"));
+        assert!(receipt.tx_digest.is_none());
         assert!(client.repay_asset(50.0).await.is_ok());
     }
 
@@ -392,6 +509,7 @@ mod tests {
             .await
             .expect("borrow custom");
         assert_eq!(receipt.asset_symbol.as_deref(), Some("SAMPLE"));
+        assert!(receipt.tx_digest.is_none());
     }
 
     #[tokio::test]
@@ -476,5 +594,16 @@ mod tests {
         // let health = client.account_health().await.unwrap();
         // assert!((health.borrow_ratio - 0.2).abs() < 1e-6);
         // assert!((health.borrowed_value - 30.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn withdraw_collateral_reduces_balance() {
+        let client = LendingClient::from_config(&sample_config());
+        client.deposit_collateral(100.0).await.unwrap();
+        client.withdraw_collateral(40.0).await.unwrap();
+
+        let health = client.account_health().await.unwrap();
+        assert!((health.collateral_value - 60.0).abs() < 1e-6);
+        assert!(client.withdraw_collateral(70.0).await.is_err());
     }
 }

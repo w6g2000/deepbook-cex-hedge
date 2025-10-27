@@ -11,6 +11,7 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
 use serde_json::Value;
 use shared::config::{NaviLendingConfig, SharedObjectConfig};
+use shared::types::NaviAssetId;
 use shared_crypto::intent::{Intent, IntentMessage};
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -33,6 +34,9 @@ use tracing::{debug, info, warn};
 
 const MIN_FETCH_BATCH: usize = 50;
 const SUI_COIN_TYPE: &str = "0x2::sui::SUI";
+const SUI_FRAMEWORK_PACKAGE: &str = "0x2";
+const COIN_MODULE: &str = "coin";
+const COIN_FROM_BALANCE_FN: &str = "from_balance";
 const NAVI_STORAGE_MODULE: &str = "storage";
 const NAVI_GET_USER_ASSETS_FN: &str = "get_user_assets";
 const NAVI_GET_INDEX_FN: &str = "get_index";
@@ -51,14 +55,23 @@ pub struct NaviOnchainClient {
     package: ObjectID,
     module: Identifier,
     function: Identifier,
+    withdraw_function: Identifier,
+    borrow_function: Identifier,
+    repay_function: Identifier,
     coin_type: String,
     coin_type_tag: TypeTag,
     coin_decimals: u8,
-    asset_id: u8,
+    asset_id: NaviAssetId,
+    borrow_coin_type: String,
+    borrow_coin_type_tag: TypeTag,
+    borrow_coin_decimals: u8,
+    borrow_asset_id: NaviAssetId,
     gas_budget: u64,
     clock: SharedObjectArg,
+    oracle: SharedObjectArg,
     storage: SharedObjectArg,
-    pool: SharedObjectArg,
+    collateral_pool: SharedObjectArg,
+    borrow_pool: SharedObjectArg,
     incentive_v2: SharedObjectArg,
     incentive_v3: SharedObjectArg,
     storage_module: Identifier,
@@ -253,14 +266,45 @@ impl NaviOnchainClient {
             .with_context(|| format!("invalid module name {}", config.module))?;
         let function = Identifier::new(config.function.clone())
             .with_context(|| format!("invalid function name {}", config.function))?;
+        let withdraw_function = Identifier::new(config.withdraw_function.clone())
+            .with_context(|| format!("invalid function name {}", config.withdraw_function))?;
+        let borrow_function = Identifier::new(config.borrow_function.clone())
+            .with_context(|| format!("invalid function name {}", config.borrow_function))?;
+        let repay_function = Identifier::new(config.repay_function.clone())
+            .with_context(|| format!("invalid function name {}", config.repay_function))?;
 
         let coin_type_tag = sui_sdk::types::parse_sui_type_tag(&config.coin_type)
             .with_context(|| format!("invalid coin type {}", config.coin_type))?;
+        let borrow_coin_type_tag = sui_sdk::types::parse_sui_type_tag(&config.borrow_coin_type)
+            .with_context(|| format!("invalid coin type {}", config.borrow_coin_type))?;
 
         let clock = SharedObjectArg::from_config(config.clock.as_ref(), "lending.navi.clock")?;
+        let oracle = SharedObjectArg::from_config(config.oracle.as_ref(), "lending.navi.oracle")?;
         let storage =
             SharedObjectArg::from_config(config.storage.as_ref(), "lending.navi.storage")?;
-        let pool = SharedObjectArg::from_config(config.pool.as_ref(), "lending.navi.pool")?;
+
+        let collateral_pool_cfg = if let Some(cfg) = config.collateral_pool.as_ref() {
+            Some(cfg)
+        } else {
+            config.pool.as_ref()
+        };
+        let collateral_pool =
+            SharedObjectArg::from_config(collateral_pool_cfg, "lending.navi.collateral_pool")?;
+
+        let borrow_pool_cfg = if let Some(cfg) = config.borrow_pool.as_ref() {
+            Some(cfg)
+        } else {
+            config.pool.as_ref()
+        };
+        let borrow_pool =
+            SharedObjectArg::from_config(borrow_pool_cfg, "lending.navi.borrow_pool")?;
+
+        let collateral_pool_id = collateral_pool_cfg
+            .map(|cfg| cfg.object_id.as_str())
+            .unwrap_or("N/A");
+        let borrow_pool_id = borrow_pool_cfg
+            .map(|cfg| cfg.object_id.as_str())
+            .unwrap_or("N/A");
         let incentive_v2 = SharedObjectArg::from_config(
             config.incentive_v2.as_ref(),
             "lending.navi.incentive_v2",
@@ -308,6 +352,11 @@ impl NaviOnchainClient {
             coin_type = %config.coin_type,
             module = config.module,
             function = config.function,
+            withdraw_function = config.withdraw_function,
+            borrow_function = config.borrow_function,
+            repay_function = config.repay_function,
+            collateral_pool = collateral_pool_id,
+            borrow_pool = borrow_pool_id,
             "initialized Navi on-chain client"
         );
 
@@ -324,14 +373,23 @@ impl NaviOnchainClient {
             package,
             module,
             function,
+            withdraw_function,
+            borrow_function,
+            repay_function,
             coin_type: config.coin_type.clone(),
             coin_type_tag,
             coin_decimals: config.coin_decimals,
             asset_id: config.asset_id,
+            borrow_coin_type: config.borrow_coin_type.clone(),
+            borrow_coin_type_tag,
+            borrow_coin_decimals: config.borrow_coin_decimals,
+            borrow_asset_id: config.borrow_asset_id,
             gas_budget: config.gas_budget,
             clock,
+            oracle,
             storage,
-            pool,
+            collateral_pool,
+            borrow_pool,
             incentive_v2,
             incentive_v3,
             storage_module,
@@ -351,9 +409,9 @@ impl NaviOnchainClient {
     pub async fn deposit(&self, amount: f64) -> Result<SuiTransactionBlockResponse> {
         ensure!(amount > 0.0, LendingError::InvalidAmount(amount));
         let amount_units = self
-            .amount_to_base_units(amount)
+            .amount_to_base_units(amount, self.coin_decimals)
             .with_context(|| format!("failed to convert amount {} to base units", amount))?;
-        let coin_refs = self.collect_usdc_coins(amount_units).await?;
+        let coin_refs = self.collect_coins(&self.coin_type, amount_units).await?;
         let builder = self.build_deposit_transaction(amount_units, &coin_refs)?;
         let response = self.execute_transaction(builder).await?;
 
@@ -367,11 +425,81 @@ impl NaviOnchainClient {
         Ok(response)
     }
 
-    fn amount_to_base_units(&self, amount: f64) -> Result<u64> {
+    pub async fn withdraw(&self, amount: f64) -> Result<SuiTransactionBlockResponse> {
+        ensure!(amount > 0.0, LendingError::InvalidAmount(amount));
+        let amount_units = self
+            .amount_to_base_units(amount, self.coin_decimals)
+            .with_context(|| {
+                format!("failed to convert withdraw amount {} to base units", amount)
+            })?;
+        let builder = self.build_withdraw_transaction(amount_units)?;
+        let response = self.execute_transaction(builder).await?;
+
+        info!(
+            amount,
+            amount_units,
+            asset = %self.asset_id,
+            asset_id = u8::from(self.asset_id),
+            tx_digest = %response.digest,
+            "submitted Navi withdraw"
+        );
+
+        Ok(response)
+    }
+
+    pub async fn borrow(&self, amount: f64) -> Result<SuiTransactionBlockResponse> {
+        ensure!(amount > 0.0, LendingError::InvalidAmount(amount));
+        let amount_units = self
+            .amount_to_base_units(amount, self.borrow_coin_decimals)
+            .with_context(|| {
+                format!(
+                    "failed to convert borrow amount {} to base units with {} decimals",
+                    amount, self.borrow_coin_decimals
+                )
+            })?;
+        let builder = self.build_borrow_transaction(amount_units)?;
+        let response = self.execute_transaction(builder).await?;
+
+        info!(
+            amount,
+            amount_units,
+            asset = %self.borrow_asset_id,
+            asset_id = u8::from(self.borrow_asset_id),
+            tx_digest = %response.digest,
+            "submitted Navi borrow"
+        );
+
+        Ok(response)
+    }
+
+    pub async fn repay(&self, amount: f64) -> Result<SuiTransactionBlockResponse> {
+        ensure!(amount > 0.0, LendingError::InvalidAmount(amount));
+        let amount_units = self
+            .amount_to_base_units(amount, self.borrow_coin_decimals)
+            .with_context(|| format!("failed to convert repay amount {} to base units", amount))?;
+        let coin_refs = self
+            .collect_coins(&self.borrow_coin_type, amount_units)
+            .await?;
+        let builder = self.build_repay_transaction(amount_units, &coin_refs)?;
+        let response = self.execute_transaction(builder).await?;
+
+        info!(
+            amount,
+            amount_units,
+            asset = %self.borrow_asset_id,
+            asset_id = u8::from(self.borrow_asset_id),
+            tx_digest = %response.digest,
+            "submitted Navi repay"
+        );
+
+        Ok(response)
+    }
+
+    fn amount_to_base_units(&self, amount: f64, decimals: u8) -> Result<u64> {
         let decimal = Decimal::from_f64(amount)
             .ok_or_else(|| anyhow!("invalid decimal amount {}", amount))?;
         ensure!(decimal > Decimal::ZERO, LendingError::InvalidAmount(amount));
-        let scale = Decimal::from(10u64.pow(u32::from(self.coin_decimals)));
+        let scale = Decimal::from(10u64.pow(u32::from(decimals)));
         let units = (decimal * scale).round();
         let units_u64 = units
             .to_u64()
@@ -380,7 +508,7 @@ impl NaviOnchainClient {
         Ok(units_u64)
     }
 
-    async fn collect_usdc_coins(&self, required: u64) -> Result<Vec<ObjectRef>> {
+    async fn collect_coins(&self, coin_type: &str, required: u64) -> Result<Vec<ObjectRef>> {
         let mut cursor = None;
         let mut accumulated: Vec<Coin> = Vec::new();
         let mut total: u128 = 0;
@@ -392,12 +520,12 @@ impl NaviOnchainClient {
                 .coin_read_api()
                 .get_coins(
                     self.sender,
-                    Some(self.coin_type.clone()),
+                    Some(coin_type.to_string()),
                     cursor.clone(),
                     Some(MIN_FETCH_BATCH),
                 )
                 .await
-                .with_context(|| format!("failed to fetch {} coins", self.coin_type))?;
+                .with_context(|| format!("failed to fetch {} coins", coin_type))?;
 
             if page.data.is_empty() {
                 break;
@@ -420,7 +548,7 @@ impl NaviOnchainClient {
             total >= required_u128,
             anyhow!(
                 "insufficient {} balance: required {}, available {}",
-                self.coin_type,
+                coin_type,
                 required_u128,
                 total
             )
@@ -442,7 +570,7 @@ impl NaviOnchainClient {
             .map(|coin| coin.object_ref())
             .collect::<Vec<_>>();
 
-        ensure!(!refs.is_empty(), "no coins selected for deposit");
+        ensure!(!refs.is_empty(), "no coins selected for transaction");
         Ok(refs)
     }
 
@@ -521,11 +649,12 @@ impl NaviOnchainClient {
     }
 
     /// 调用 `storage::get_index` 获取指定资产的借款/抵押指数。
-    pub async fn fetch_asset_index(&self, asset_id: u8) -> Result<NaviAssetIndex> {
+    pub async fn fetch_asset_index(&self, asset_id: NaviAssetId) -> Result<NaviAssetIndex> {
         let mut builder = ProgrammableTransactionBuilder::new();
 
         let storage = self.storage.to_argument(&mut builder)?;
-        let asset_arg = builder.pure(asset_id)?;
+        let asset_u8 = u8::from(asset_id);
+        let asset_arg = builder.pure(asset_u8)?;
 
         builder.programmable_move_call(
             self.package,
@@ -543,7 +672,10 @@ impl NaviOnchainClient {
             .dev_inspect_transaction_block(self.sender, tx_kind, None, None, None)
             .await
             .with_context(|| {
-                format!("dev inspect storage::get_index 失败 (asset_id={asset_id})")
+                format!(
+                    "dev inspect storage::get_index 失败 (asset_id={}, symbol={})",
+                    asset_u8, asset_id
+                )
             })?;
 
         if let Some(error) = inspection.error.clone() {
@@ -577,14 +709,15 @@ impl NaviOnchainClient {
             from_bytes(supply_bytes).context("解析 storage::get_index supply_index 失败")?;
 
         debug!(
-            asset_id,
+            asset = %asset_id,
+            asset_id = asset_u8,
             borrow_index_raw = %borrow_index,
             supply_index_raw = %supply_index,
             "storage::get_index 返回原始指数"
         );
 
         Ok(NaviAssetIndex {
-            asset_id,
+            asset_id: asset_u8,
             borrow_index,
             supply_index,
             scale: ONCHAIN_INDEX_DECIMALS,
@@ -592,19 +725,19 @@ impl NaviOnchainClient {
         })
     }
 
-    async fn fetch_pool_index(&self, asset_id: u8) -> Result<NaviAssetIndex> {
+    async fn fetch_pool_index(&self, asset_id: NaviAssetId) -> Result<NaviAssetIndex> {
         let pools = self
             .pool_cache
             .get_or_try_init(|| async { self.load_pools().await })
             .await?;
         let pool = pools
             .iter()
-            .find(|pool| pool.asset_id == asset_id)
+            .find(|pool| pool.asset_id == u8::from(asset_id))
             .cloned()
-            .with_context(|| format!("未找到资产 {asset_id} 的池化数据"))?;
+            .with_context(|| format!("未找到资产 {} 的池化数据", asset_id))?;
 
         Ok(NaviAssetIndex {
-            asset_id,
+            asset_id: u8::from(asset_id),
             borrow_index: pool.current_borrow_index,
             supply_index: pool.current_supply_index,
             scale: API_INDEX_DECIMALS,
@@ -691,16 +824,17 @@ impl NaviOnchainClient {
     }
 
     /// 调用 Navi UI Getter 获取指定资产的抵押/借款数值。
-    pub async fn fetch_user_balance(&self, asset_id: u8) -> Result<NaviAssetBalance> {
+    pub async fn fetch_user_balance(&self, asset_id: NaviAssetId) -> Result<NaviAssetBalance> {
         let entries = self.fetch_user_state_entries(self.sender).await?;
         let (supplied_shares, borrowed_shares) = entries
             .into_iter()
-            .find(|entry| entry.asset_id == asset_id)
+            .find(|entry| entry.asset_id == u8::from(asset_id))
             .map(|entry| (entry.supply_balance, entry.borrow_balance))
             .unwrap_or_else(|| (U256::zero(), U256::zero()));
 
         debug!(
-            asset_id,
+            asset = %asset_id,
+            asset_id = u8::from(asset_id),
             supplied_shares = %supplied_shares,
             borrowed_shares = %borrowed_shares,
             "ui_getter::get_user_state 返回原始数值 (shares)"
@@ -709,17 +843,144 @@ impl NaviOnchainClient {
         let index = match self.fetch_pool_index(asset_id).await {
             Ok(idx) => idx,
             Err(err) => {
-                warn!(asset_id, error = %err, "fetch_pool_index 失败，回退到链上 get_index");
+                warn!(
+                    asset = %asset_id,
+                    asset_id = u8::from(asset_id),
+                    error = %err,
+                    "fetch_pool_index 失败，回退到链上 get_index"
+                );
                 self.fetch_asset_index(asset_id).await?
             }
         };
 
         Ok(NaviAssetBalance {
-            asset_id,
+            asset_id: u8::from(asset_id),
             supplied_shares,
             borrowed_shares,
             index,
         })
+    }
+
+    fn build_withdraw_transaction(
+        &self,
+        amount_units: u64,
+    ) -> Result<ProgrammableTransactionBuilder> {
+        ensure!(amount_units > 0, "withdraw requires positive amount");
+
+        let mut builder = ProgrammableTransactionBuilder::new();
+
+        let clock = self.clock.to_argument(&mut builder)?;
+        let oracle = self.oracle.to_argument(&mut builder)?;
+        let storage = self.storage.to_argument(&mut builder)?;
+        let pool = self.collateral_pool.to_argument(&mut builder)?;
+        let incentive_v2 = self.incentive_v2.to_argument(&mut builder)?;
+        let incentive_v3 = self.incentive_v3.to_argument(&mut builder)?;
+        let asset_id = builder.pure(u8::from(self.asset_id))?;
+        let amount_arg = builder.pure(amount_units)?;
+
+        let withdraw_balance = builder.programmable_move_call(
+            self.package,
+            self.module.clone(),
+            self.withdraw_function.clone(),
+            vec![self.coin_type_tag.clone()],
+            vec![
+                clock,
+                oracle,
+                storage,
+                pool,
+                asset_id,
+                amount_arg,
+                incentive_v2,
+                incentive_v3,
+            ],
+        );
+
+        let coin_package = ObjectID::from_str(SUI_FRAMEWORK_PACKAGE)
+            .context("failed to parse Sui framework package id 0x2")?;
+        let coin_module = Identifier::new(COIN_MODULE.to_string())
+            .with_context(|| format!("invalid module name {}", COIN_MODULE))?;
+        let coin_from_balance = Identifier::new(COIN_FROM_BALANCE_FN.to_string())
+            .with_context(|| format!("invalid function name {}", COIN_FROM_BALANCE_FN))?;
+
+        let withdrawn_coin = builder.programmable_move_call(
+            coin_package,
+            coin_module,
+            coin_from_balance,
+            vec![self.coin_type_tag.clone()],
+            vec![withdraw_balance],
+        );
+
+        let coin_argument = match withdrawn_coin {
+            Argument::Result(idx) => Argument::Result(idx),
+            Argument::NestedResult(idx, inner) => Argument::NestedResult(idx, inner),
+            other => bail!("unexpected coin::from_balance result {:?}", other),
+        };
+
+        let recipient = builder.pure(self.sender)?;
+        let _ = builder.command(Command::TransferObjects(vec![coin_argument], recipient));
+
+        Ok(builder)
+    }
+
+    fn build_borrow_transaction(
+        &self,
+        amount_units: u64,
+    ) -> Result<ProgrammableTransactionBuilder> {
+        ensure!(amount_units > 0, "borrow requires positive amount");
+
+        let mut builder = ProgrammableTransactionBuilder::new();
+
+        let clock = self.clock.to_argument(&mut builder)?;
+        let oracle = self.oracle.to_argument(&mut builder)?;
+        let storage = self.storage.to_argument(&mut builder)?;
+        let pool = self.borrow_pool.to_argument(&mut builder)?;
+        let incentive_v2 = self.incentive_v2.to_argument(&mut builder)?;
+        let incentive_v3 = self.incentive_v3.to_argument(&mut builder)?;
+        let asset_id = builder.pure(u8::from(self.borrow_asset_id))?;
+        let amount_arg = builder.pure(amount_units)?;
+
+        let borrow_balance = builder.programmable_move_call(
+            self.package,
+            self.module.clone(),
+            self.borrow_function.clone(),
+            vec![self.borrow_coin_type_tag.clone()],
+            vec![
+                clock,
+                oracle,
+                storage,
+                pool,
+                asset_id,
+                amount_arg,
+                incentive_v2,
+                incentive_v3,
+            ],
+        );
+
+        let coin_package = ObjectID::from_str(SUI_FRAMEWORK_PACKAGE)
+            .context("failed to parse Sui framework package id 0x2")?;
+        let coin_module = Identifier::new(COIN_MODULE.to_string())
+            .with_context(|| format!("invalid module name {}", COIN_MODULE))?;
+        let coin_from_balance = Identifier::new(COIN_FROM_BALANCE_FN.to_string())
+            .with_context(|| format!("invalid function name {}", COIN_FROM_BALANCE_FN))?;
+
+        let borrowed_coin = builder.programmable_move_call(
+            coin_package,
+            coin_module,
+            coin_from_balance,
+            vec![self.borrow_coin_type_tag.clone()],
+            vec![borrow_balance],
+        );
+
+        let coin_argument = match borrowed_coin {
+            Argument::Result(idx) => Argument::Result(idx),
+            Argument::NestedResult(idx, inner) => Argument::NestedResult(idx, inner),
+            other => bail!("unexpected coin::from_balance result {:?}", other),
+        };
+
+        let recipient = builder.pure(self.sender)?;
+        let _ = builder.command(Command::TransferObjects(vec![coin_argument], recipient));
+
+        Ok(builder)
     }
 
     fn build_deposit_transaction(
@@ -746,11 +1007,11 @@ impl NaviOnchainClient {
 
         let clock = self.clock.to_argument(&mut builder)?;
         let storage = self.storage.to_argument(&mut builder)?;
-        let pool = self.pool.to_argument(&mut builder)?;
+        let pool = self.borrow_pool.to_argument(&mut builder)?;
         let incentive_v2 = self.incentive_v2.to_argument(&mut builder)?;
         let incentive_v3 = self.incentive_v3.to_argument(&mut builder)?;
 
-        let asset_id = builder.pure(self.asset_id)?;
+        let asset_id = builder.pure(u8::from(self.asset_id))?;
         let amount_arg_call = builder.pure(amount_units)?;
 
         builder.programmable_move_call(
@@ -764,6 +1025,59 @@ impl NaviOnchainClient {
                 pool,
                 asset_id,
                 deposit_coin,
+                amount_arg_call,
+                incentive_v2,
+                incentive_v3,
+            ],
+        );
+
+        Ok(builder)
+    }
+
+    fn build_repay_transaction(
+        &self,
+        amount_units: u64,
+        coins: &[ObjectRef],
+    ) -> Result<ProgrammableTransactionBuilder> {
+        ensure!(!coins.is_empty(), "repay requires at least one coin");
+
+        let mut builder = ProgrammableTransactionBuilder::new();
+        let primary = if coins.len() == 1 {
+            builder.obj(ObjectArg::ImmOrOwnedObject(coins[0]))?
+        } else {
+            builder.smash_coins(coins.to_vec())?
+        };
+
+        let amount_arg_split = builder.pure(amount_units)?;
+        let split_result = builder.command(Command::SplitCoins(primary, vec![amount_arg_split]));
+        let split_index = match split_result {
+            Argument::Result(idx) => idx,
+            other => bail!("unexpected split result {:?}", other),
+        };
+        let repay_coin = Argument::NestedResult(split_index, 0);
+
+        let clock = self.clock.to_argument(&mut builder)?;
+        let oracle = self.oracle.to_argument(&mut builder)?;
+        let storage = self.storage.to_argument(&mut builder)?;
+        let pool = self.borrow_pool.to_argument(&mut builder)?;
+        let incentive_v2 = self.incentive_v2.to_argument(&mut builder)?;
+        let incentive_v3 = self.incentive_v3.to_argument(&mut builder)?;
+
+        let asset_id = builder.pure(u8::from(self.borrow_asset_id))?;
+        let amount_arg_call = builder.pure(amount_units)?;
+
+        builder.programmable_move_call(
+            self.package,
+            self.module.clone(),
+            self.repay_function.clone(),
+            vec![self.borrow_coin_type_tag.clone()],
+            vec![
+                clock,
+                oracle,
+                storage,
+                pool,
+                asset_id,
+                repay_coin,
                 amount_arg_call,
                 incentive_v2,
                 incentive_v3,
@@ -813,13 +1127,13 @@ impl NaviOnchainClient {
                 Some(ExecuteTransactionRequestType::WaitForLocalExecution),
             )
             .await
-            .context("failed to execute Navi deposit transaction")?;
+            .context("failed to execute Navi transaction")?;
 
         if let Some(effects) = &response.effects {
             debug!(
                 digest = %effects.transaction_digest(),
                 status = ?effects.status(),
-                "Navi deposit transaction effects"
+                "Navi transaction effects"
             );
         }
 

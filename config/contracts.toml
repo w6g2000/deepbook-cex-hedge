@@ -10,9 +10,15 @@ rpc_endpoint = "https://fullnode.mainnet.sui.io:443"
 package_id = "0x81c408448d0d57b3e371ea94de1d40bf852784d3e225de1e74acab3e8395c18f"
 module = "incentive_v3"
 function = "entry_deposit"
+withdraw_function = "withdraw"
+borrow_function = "borrow"
+repay_function = "entry_repay"
 coin_type = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC"
 coin_decimals = 6
-asset_id = 10
+asset_id = "usdc"
+borrow_coin_type = "0x356a26eb9e012a68958082340d4c4116e7f55615cf27affcff209cf0ae544f59::wal::WAL"
+borrow_coin_decimals = 9
+borrow_asset_id = "wal"
 gas_budget = 60_000_000
 
 [lending_navi.clock]
@@ -20,14 +26,24 @@ object_id = "0x0000000000000000000000000000000000000000000000000000000000000006"
 initial_shared_version = 1
 mutable = false
 
+[lending_navi.oracle]
+object_id = "0x1568865ed9a0b5ec414220e8f79b3d04c77acc82358f6e5ae4635687392ffbef"
+initial_shared_version = 8_202_835
+mutable = false
+
 [lending_navi.storage]
 object_id = "0xbb4e2f4b6205c2e2a2db47aeb4f830796ec7c005f88537ee775986639bc442fe"
 initial_shared_version = 8_202_844
 mutable = true
 
-[lending_navi.pool]
+[lending_navi.collateral_pool]
 object_id = "0xa3582097b4c57630046c0c49a88bfc6b202a3ec0a9db5597c31765f7563755a8"
 initial_shared_version = 372_449_049
+mutable = true
+
+[lending_navi.borrow_pool]
+object_id = "0xef76883525f5c2ff90cd97732940dbbdba0b391e29de839b10588cee8e4fe167"
+initial_shared_version = 510_342_415
 mutable = true
 
 [lending_navi.incentive_v2]

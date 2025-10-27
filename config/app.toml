@@ -20,8 +20,8 @@ level = 2
 depth = 30
 # 轮询频率（毫秒），减小可更快更新但更耗资源。
 poll_interval_ms = 1000
-# DeepBook 链上下单所需的私钥环境变量名（请在 .env 中设置 DEEPBOOK_PRIVATE_KEY）。
-signer_env = "DEEPBOOK_PRIVATE_KEY"
+# DeepBook 链上下单所需的私钥环境变量名（请在 .env 中设置 HEDGE_SIGNER_KEY）。
+signer_env = "HEDGE_SIGNER_KEY"
 
 [cex]
 # 币安 REST 深度接口，用于初始化 orderbook。
