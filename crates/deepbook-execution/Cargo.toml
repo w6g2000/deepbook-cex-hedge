@@ -21,3 +21,4 @@ sui-deepbookv3 = { workspace = true }
 sui-keys = { workspace = true }
 shared-crypto = { workspace = true }
 dotenvy = "0.15"
+serde_json = { workspace = true }

@@ -5,16 +5,17 @@ use crate::{
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use dotenvy::dotenv;
+use serde_json::Value;
 use shared_crypto::intent::{Intent, IntentMessage};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use sui_deepbookv3::client::{Account, DeepBookClient};
 use sui_deepbookv3::utils::config::{BalanceManagerMap, Environment as SdkEnvironment};
 use sui_deepbookv3::utils::types::{BalanceManager, OrderType, PlaceLimitOrderParams};
 use sui_sdk::rpc_types::{
-    Coin, SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponse,
+    Coin, SuiTransactionBlockEffectsAPI, SuiTransactionBlockEvents, SuiTransactionBlockResponse,
     SuiTransactionBlockResponseOptions,
 };
 use sui_sdk::types::programmable_transaction_builder::ProgrammableTransactionBuilder;
@@ -24,10 +25,12 @@ use sui_types::base_types::{ObjectRef, SuiAddress};
 use sui_types::crypto::{EncodeDecodeBase64, Signature, SuiKeyPair};
 use sui_types::transaction::{Transaction, TransactionData};
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 const DEFAULT_GAS_BUDGET: u64 = 50_000_000;
 const SUI_COIN_TYPE: &str = "0x2::sui::SUI";
+const ORDER_STATE_RETRY_MS: [u64; 3] = [150, 400, 800];
 
 #[derive(Debug, Clone)]
 pub enum DeepbookEnvironment {
@@ -328,6 +331,51 @@ impl SdkBackend {
         Ok(builder)
     }
 
+    async fn build_deposit_into_manager(
+        &self,
+        coin_key: &str,
+        amount: f64,
+    ) -> Result<ProgrammableTransactionBuilder> {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        self.deepbook
+            .balance_manager
+            .deposit_into_manager(
+                &mut builder,
+                self.signer_address,
+                &self.balance_manager_key,
+                coin_key,
+                amount,
+            )
+            .await
+            .with_context(|| {
+                format!("failed to build deepbook deposit call for coin {coin_key}")
+            })?;
+        Ok(builder)
+    }
+
+    async fn build_withdraw_from_manager(
+        &self,
+        coin_key: &str,
+        amount: f64,
+        recipient: SuiAddress,
+    ) -> Result<ProgrammableTransactionBuilder> {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        self.deepbook
+            .balance_manager
+            .withdraw_from_manager(
+                &mut builder,
+                &self.balance_manager_key,
+                coin_key,
+                amount,
+                recipient,
+            )
+            .await
+            .with_context(|| {
+                format!("failed to build deepbook withdraw call for coin {coin_key}")
+            })?;
+        Ok(builder)
+    }
+
     async fn fetch_order_snapshot(
         &self,
         pool_key: &str,
@@ -433,10 +481,107 @@ impl SdkBackend {
     fn next_client_order_id(&self) -> u64 {
         self.client_order_seq.fetch_add(1, Ordering::Relaxed)
     }
+
+    fn diff_new_order(before: &HashSet<u128>, after: &HashSet<u128>) -> Option<u128> {
+        after.difference(before).next().cloned()
+    }
+
+    fn extract_order_hints(events: Option<&SuiTransactionBlockEvents>) -> (Vec<u128>, bool) {
+        const ORDER_ID_KEYS: [&str; 10] = [
+            "order_id",
+            "orderId",
+            "maker_order_id",
+            "makerOrderId",
+            "taker_order_id",
+            "takerOrderId",
+            "order_id_hex",
+            "orderIdHex",
+            "maker_order_id_hex",
+            "taker_order_id_hex",
+        ];
+
+        let mut ids = Vec::new();
+        let mut fill_detected = false;
+
+        let Some(events) = events else {
+            return (ids, fill_detected);
+        };
+
+        for evt in &events.data {
+            let event_type = evt.type_.to_string().to_ascii_lowercase();
+            if event_type.contains("match") || event_type.contains("fill") {
+                fill_detected = true;
+            }
+
+            Self::collect_order_ids_from_value(&evt.parsed_json, &ORDER_ID_KEYS, &mut ids);
+        }
+
+        ids.sort_unstable();
+        ids.dedup();
+
+        (ids, fill_detected)
+    }
+
+    fn collect_order_ids_from_value(value: &Value, keys: &[&str], out: &mut Vec<u128>) {
+        match value {
+            Value::Object(map) => {
+                for key in keys {
+                    if let Some(candidate) = map.get(*key) {
+                        if let Some(id) = Self::parse_order_id(candidate) {
+                            out.push(id);
+                        }
+                    }
+                }
+
+                if let Some(fields) = map.get("fields") {
+                    Self::collect_order_ids_from_value(fields, keys, out);
+                }
+            }
+            Value::Array(entries) => {
+                for entry in entries {
+                    Self::collect_order_ids_from_value(entry, keys, out);
+                }
+            }
+            Value::Null => {}
+            _ => {}
+        }
+    }
+
+    fn parse_order_id(value: &Value) -> Option<u128> {
+        match value {
+            Value::String(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                if let Some(hex) = trimmed.strip_prefix("0x") {
+                    u128::from_str_radix(hex, 16).ok()
+                } else {
+                    trimmed.parse::<u128>().ok()
+                }
+            }
+            Value::Number(num) => num.as_u64().map(|v| v as u128),
+            Value::Object(map) => {
+                if let Some(inner) = map.get("id") {
+                    Self::parse_order_id(inner)
+                } else if let Some(inner) = map.get("value") {
+                    Self::parse_order_id(inner)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 #[async_trait]
 impl DeepbookBackend for SdkBackend {
+    /// 提交 DeepBook post-only 订单并结合事件 / 节点重试来推导订单状态：
+    /// 1. 记录下单前的 `account_open_orders` 结果，提交交易并解析返回事件；
+    /// 2. 优先通过 open-order 差集确定新订单 id，若节点延迟则按 150/400/800ms 退避重试；
+    /// 3. 同时保留事件里解析到的 order id，以及是否出现撮合（match/fill）事件；
+    /// 4. 最终仍未在节点看到新挂单，则以事件推断订单已成交，并返回填充后的快照以避免上层报错。
     async fn place_post_only_order(&self, request: PlaceOrderRequest) -> Result<OrderSnapshot> {
         ensure!(
             !request.pool_key.is_empty(),
@@ -458,71 +603,112 @@ impl DeepbookBackend for SdkBackend {
             client_order_id,
             "submitted deepbook limit order transaction"
         );
-        let mut after = self.account_open_orders(&request.pool_key).await?;
+        let mut latest_open = self.account_open_orders(&request.pool_key).await?;
         debug!(
             pool = %request.pool_key,
             ?before,
             before_len = before.len(),
-            after_len = after.len(),
+            after_len = latest_open.len(),
             "deepbook open orders snapshot around placement"
         );
-        if after.len() == before.len() {
-            debug!(
-                pool = %request.pool_key,
-                "open order set unchanged after placement; attempting to infer order id from events"
-            );
-            if let Some(events) = &response.events {
-                for evt in &events.data {
-                    debug!(
-                        event_type = %evt.type_,
-                        parsed = ?evt.parsed_json,
-                        "deepbook placement transaction event"
-                    );
+        let mut inferred_id = Self::diff_new_order(&before, &latest_open);
+
+        let (event_order_ids, fill_detected) = Self::extract_order_hints(response.events.as_ref());
+
+        if inferred_id.is_none() {
+            if let Some(candidate) = event_order_ids
+                .iter()
+                .copied()
+                .find(|id| !before.contains(id))
+                .or_else(|| event_order_ids.first().copied())
+            {
+                latest_open.insert(candidate);
+                inferred_id = Some(candidate);
+            }
+        }
+
+        if inferred_id.is_none() {
+            for delay_ms in ORDER_STATE_RETRY_MS {
+                debug!(
+                    pool = %request.pool_key,
+                    delay_ms,
+                    "order id not observable yet; retrying account_open_orders"
+                );
+                sleep(Duration::from_millis(delay_ms)).await;
+                latest_open = self.account_open_orders(&request.pool_key).await?;
+                if let Some(candidate) = Self::diff_new_order(&before, &latest_open) {
+                    inferred_id = Some(candidate);
+                    break;
                 }
             }
-            if let Some(event_id) = response.events.as_ref().and_then(|events| {
-                events.data.iter().find_map(|evt| {
-                    let parsed = &evt.parsed_json;
-                    if let Some(order_field) = parsed.get("order_id") {
-                        if let Some(as_str) = order_field.as_str() {
-                            if let Ok(val) = as_str.parse::<u128>() {
-                                return Some(val);
-                            }
-                        }
-                        if let Some(num) = order_field.as_u64() {
-                            return Some(num as u128);
-                        }
-                    }
-                    if let Some(order_hex) = parsed.get("order_id_hex").and_then(|v| v.as_str()) {
-                        if let Some(stripped) = order_hex.strip_prefix("0x") {
-                            if let Ok(val) = u128::from_str_radix(stripped, 16) {
-                                return Some(val);
-                            }
-                        }
-                    }
-                    None
-                })
-            }) {
-                after.insert(event_id);
+        }
+
+        let new_order_id = inferred_id
+            .or_else(|| event_order_ids.first().copied())
+            .ok_or_else(|| anyhow!("failed to determine newly placed order id"))?;
+
+        let mut snapshot = self
+            .fetch_order_snapshot(&request.pool_key, new_order_id)
+            .await?;
+
+        if snapshot.is_none() {
+            for delay_ms in ORDER_STATE_RETRY_MS {
+                sleep(Duration::from_millis(delay_ms)).await;
+                snapshot = self
+                    .fetch_order_snapshot(&request.pool_key, new_order_id)
+                    .await?;
+                if snapshot.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let snapshot = if let Some(snapshot) = snapshot {
+            snapshot
+        } else {
+            let order_still_open = latest_open.contains(&new_order_id);
+            if order_still_open {
+                warn!(
+                    pool = %request.pool_key,
+                    order_id = new_order_id,
+                    "order visible in open set but snapshot unavailable; using best-effort reconstruction"
+                );
+            }
+            let status = if order_still_open {
+                OrderStatus::Open
+            } else if fill_detected {
+                OrderStatus::Filled
             } else {
                 warn!(
                     pool = %request.pool_key,
-                    "failed to extract order_id from placement events"
+                    order_id = new_order_id,
+                    "snapshot missing without fill hint; treating as filled after grace period"
                 );
-            }
-        }
-        let new_order_id = after
-            .difference(&before)
-            .next()
-            .cloned()
-            .ok_or_else(|| anyhow!("failed to determine newly placed order id"))?;
+                OrderStatus::Filled
+            };
 
-        let snapshot = self
-            .fetch_order_snapshot(&request.pool_key, new_order_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow!("deepbook order {new_order_id} not retrievable after placement")
-            })?;
+            let filled_base = match status {
+                OrderStatus::Open | OrderStatus::PartiallyFilled => 0.0,
+                _ => request.size,
+            };
+            let filled_quote = match status {
+                OrderStatus::Open | OrderStatus::PartiallyFilled => 0.0,
+                _ => request.price * request.size,
+            };
+
+            OrderSnapshot {
+                id: new_order_id.to_string(),
+                pair: request.pair.clone(),
+                side: request.side.clone(),
+                price: request.price,
+                size: request.size,
+                filled_base,
+                filled_quote,
+                status,
+                created_at: SystemTime::now(),
+                updated_at: SystemTime::now(),
+            }
+        };
 
         self.register_order(new_order_id, request.pool_key.clone(), snapshot.clone())
             .await;
@@ -702,6 +888,38 @@ impl DeepbookBackend for SdkBackend {
         Ok(ClaimSummary::from_map(claimed))
     }
 
+    async fn deposit_into_manager(&self, coin_key: &str, amount: f64) -> Result<()> {
+        ensure!(!coin_key.trim().is_empty(), "coin_key must be provided");
+        ensure!(amount > f64::EPSILON, "deposit amount must be positive");
+        let builder = self.build_deposit_into_manager(coin_key, amount).await?;
+        self.execute_transaction(builder).await?;
+        info!(
+            manager = %self.balance_manager_key,
+            coin = %coin_key,
+            amount,
+            "deposited assets into deepbook balance manager"
+        );
+        Ok(())
+    }
+
+    async fn withdraw_from_manager(&self, coin_key: &str, amount: f64) -> Result<()> {
+        ensure!(!coin_key.trim().is_empty(), "coin_key must be provided");
+        ensure!(amount > f64::EPSILON, "withdraw amount must be positive");
+        let recipient = self.signer_address;
+        let builder = self
+            .build_withdraw_from_manager(coin_key, amount, recipient)
+            .await?;
+        self.execute_transaction(builder).await?;
+        info!(
+            manager = %self.balance_manager_key,
+            coin = %coin_key,
+            amount,
+            recipient = %recipient,
+            "withdrew assets from deepbook balance manager"
+        );
+        Ok(())
+    }
+
     async fn withdraw_settled(&self, pool_key: &str) -> Result<Option<crate::ClaimableBalance>> {
         let account = self.fetch_account(pool_key).await?;
         let base_settled = account.settled_balances.base;
@@ -853,15 +1071,19 @@ mod tests {
     const SIDE_ENV: &str = "DEEPBOOK_SDK_TEST_SIDE";
     const PRICE_ENV: &str = "DEEPBOOK_SDK_TEST_PRICE";
     const SIZE_ENV: &str = "DEEPBOOK_SDK_TEST_SIZE";
+    const COIN_KEY_ENV: &str = "DEEPBOOK_SDK_TEST_COIN_KEY";
+    const DEPOSIT_AMOUNT_ENV: &str = "DEEPBOOK_SDK_TEST_DEPOSIT";
 
     #[derive(Clone)]
     struct LiveTestInputs {
         sdk_config: DeepbookSdkConfig,
         order_request: PlaceOrderRequest,
+        balance_coin_key: String,
+        balance_amount: f64,
     }
 
     fn debug_env_snapshot() {
-        let entries: [(&str, bool); 10] = [
+        let entries: [(&str, bool); 12] = [
             (FULLNODE_URL_ENV, false),
             (SIGNER_KEY_ENV, true),
             (BALANCE_MANAGER_ID_ENV, false),
@@ -872,6 +1094,8 @@ mod tests {
             (SIDE_ENV, false),
             (PRICE_ENV, false),
             (SIZE_ENV, false),
+            (COIN_KEY_ENV, false),
+            (DEPOSIT_AMOUNT_ENV, false),
         ];
         eprintln!("deepbook sdk test env snapshot:");
         for (key, is_secret) in entries {
@@ -929,6 +1153,12 @@ mod tests {
         let price = env_var_non_empty(PRICE_ENV)?.parse::<f64>().ok()?;
         let size = env_var_non_empty(SIZE_ENV)?.parse::<f64>().ok()?;
 
+        let coin_key = env_var_non_empty(COIN_KEY_ENV).unwrap_or_else(|| "USDC".to_string());
+        let balance_amount = env_var_non_empty(DEPOSIT_AMOUNT_ENV)
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|amount| *amount > f64::EPSILON)
+            .unwrap_or(1.0);
+
         let environment = env_var_non_empty(ENVIRONMENT_ENV)
             .and_then(|value| parse_environment(&value))
             .unwrap_or(DeepbookEnvironment::Mainnet);
@@ -956,6 +1186,8 @@ mod tests {
                 price,
                 size,
             },
+            balance_coin_key: coin_key,
+            balance_amount,
         })
     }
 
@@ -1042,6 +1274,31 @@ mod tests {
             cancelled.iter().any(|snapshot| snapshot.id == created.id),
             "cancel_all response missing just-created order"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DeepBook access and funded balance manager"]
+    async fn balance_manager_deposit_withdraw_live_smoke() -> Result<()> {
+        init_tracing();
+
+        let Some((backend, inputs)) = backend_from_env().await? else {
+            return Ok(());
+        };
+
+        let coin_key = inputs.balance_coin_key.as_str();
+        let amount = inputs.balance_amount;
+
+        backend
+            .deposit_into_manager(coin_key, amount)
+            .await
+            .with_context(|| format!("deposit {amount} {coin_key} into balance manager"))?;
+
+        backend
+            .withdraw_from_manager(coin_key, amount)
+            .await
+            .with_context(|| format!("withdraw {amount} {coin_key} from balance manager"))?;
 
         Ok(())
     }

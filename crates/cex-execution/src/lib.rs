@@ -17,9 +17,9 @@ use binance_sdk::{
     spot::{
         SpotRestApi,
         rest_api::{
-            self, DeleteOpenOrdersParams, DeleteOrderParams, GetAccountParams,
-            NewOrderNewOrderRespTypeEnum, NewOrderParams, NewOrderSideEnum,
-            NewOrderTimeInForceEnum, NewOrderTypeEnum,
+            self, DeleteOpenOrdersParams, DeleteOpenOrdersResponseInner, DeleteOrderParams,
+            GetAccountParams, GetAccountResponse, NewOrderNewOrderRespTypeEnum, NewOrderParams,
+            NewOrderResponse, NewOrderSideEnum, NewOrderTimeInForceEnum, NewOrderTypeEnum,
         },
     },
     wallet::{
@@ -253,9 +253,72 @@ impl BinanceWalletClient for DefaultWalletClient {
     }
 }
 
+#[async_trait]
+trait BinanceSpotClient: Send + Sync + std::fmt::Debug {
+    async fn new_order(&self, params: NewOrderParams) -> Result<NewOrderResponse>;
+    async fn delete_order(&self, params: DeleteOrderParams) -> Result<()>;
+    async fn delete_open_orders(
+        &self,
+        params: DeleteOpenOrdersParams,
+    ) -> Result<Vec<DeleteOpenOrdersResponseInner>>;
+    async fn get_account(&self, params: GetAccountParams) -> Result<GetAccountResponse>;
+}
+
+#[derive(Debug, Clone)]
+struct DefaultSpotClient {
+    inner: rest_api::RestApi,
+}
+
+impl DefaultSpotClient {
+    fn new(inner: rest_api::RestApi) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl BinanceSpotClient for DefaultSpotClient {
+    async fn new_order(&self, params: NewOrderParams) -> Result<NewOrderResponse> {
+        let response = self.inner.new_order(params).await?;
+        let data = response
+            .data()
+            .await
+            .map_err(|err| anyhow!(err.to_string()))
+            .context("Binance new_order 解析响应失败")?;
+        Ok(data)
+    }
+
+    async fn delete_order(&self, params: DeleteOrderParams) -> Result<()> {
+        self.inner.delete_order(params).await?;
+        Ok(())
+    }
+
+    async fn delete_open_orders(
+        &self,
+        params: DeleteOpenOrdersParams,
+    ) -> Result<Vec<DeleteOpenOrdersResponseInner>> {
+        let response = self.inner.delete_open_orders(params).await?;
+        let data = response
+            .data()
+            .await
+            .map_err(|err| anyhow!(err.to_string()))
+            .context("解析 Binance 批量撤单响应失败")?;
+        Ok(data)
+    }
+
+    async fn get_account(&self, params: GetAccountParams) -> Result<GetAccountResponse> {
+        let response = self.inner.get_account(params).await?;
+        let data = response
+            .data()
+            .await
+            .map_err(|err| anyhow!(err.to_string()))
+            .context("解析 Binance 账户资产失败")?;
+        Ok(data)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BinanceSpotExecutor {
-    client: rest_api::RestApi,
+    client: Arc<dyn BinanceSpotClient>,
     wallet_client: Arc<dyn BinanceWalletClient>,
     recv_window: Option<Decimal>,
     environment: BinanceEnvironment,
@@ -284,17 +347,18 @@ impl BinanceSpotExecutor {
         let spot_conf = config.clone();
         let wallet_conf = config;
 
-        let client = match environment {
+        let rest_client = match environment {
             BinanceEnvironment::Production => SpotRestApi::production(spot_conf),
             BinanceEnvironment::Testnet => SpotRestApi::testnet(spot_conf),
         };
+        let spot_client: Arc<dyn BinanceSpotClient> = Arc::new(DefaultSpotClient::new(rest_client));
 
         let wallet_api = WalletRestApi::from_config(wallet_conf);
         let wallet_client: Arc<dyn BinanceWalletClient> =
             Arc::new(DefaultWalletClient::new(wallet_api));
 
         Ok(Self {
-            client,
+            client: spot_client,
             wallet_client,
             recv_window,
             environment,
@@ -475,12 +539,11 @@ impl BinanceSpotExecutor {
 
     pub async fn fetch_balances(&self) -> Result<HashMap<String, SpotBalance>> {
         let params = GetAccountParams::default();
-        let response = self
+        let account = self
             .client
             .get_account(params)
             .await
             .context("Binance 查询账户资产失败")?;
-        let account = response.data().await.context("解析 Binance 账户资产失败")?;
 
         let mut balances = HashMap::new();
         for entry in account.balances.unwrap_or_default() {
@@ -566,15 +629,11 @@ impl CexExecutor for BinanceSpotExecutor {
             .build()
             .context("failed to build Binance new_order params")?;
 
-        let response = self
+        let data = self
             .client
             .new_order(params)
             .await
             .context("Binance new_order 请求失败")?;
-        let data = response
-            .data()
-            .await
-            .context("Binance new_order 解析响应失败")?;
 
         let order_symbol = data.symbol.clone().unwrap_or_else(|| symbol.clone());
         let raw_order_id = data
@@ -678,11 +737,7 @@ impl CexExecutor for BinanceSpotExecutor {
             .await
             .context("Binance 批量撤单请求失败")?;
 
-        let cancelled = response
-            .data()
-            .await
-            .context("解析 Binance 批量撤单响应失败")?
-            .len();
+        let cancelled = response.len();
 
         info!(pair = %pair, cancelled, "cancelled Binance open orders");
         Ok(cancelled)
@@ -692,12 +747,11 @@ impl CexExecutor for BinanceSpotExecutor {
         let base_asset = Self::base_asset(pair)?;
 
         let params = GetAccountParams::default();
-        let response = self
+        let account = self
             .client
             .get_account(params)
             .await
             .context("Binance 查询账户资产失败")?;
-        let account = response.data().await.context("解析 Binance 账户资产失败")?;
 
         let balances = account.balances.unwrap_or_default();
         let balance = balances.into_iter().find(|b| {
@@ -851,7 +905,14 @@ fn decimal_from_u64(value: u64) -> Result<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use binance_sdk::spot::rest_api::{
+        DeleteOpenOrdersResponseInner, GetAccountResponse, NewOrderResponse,
+    };
+    use rust_decimal::prelude::ToPrimitive;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
     #[derive(Clone, Copy)]
     struct WithdrawSmokeConfig {
@@ -1070,6 +1131,89 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct RecordedOrder {
+        symbol: String,
+        side: NewOrderSideEnum,
+        order_type: NewOrderTypeEnum,
+        time_in_force: Option<NewOrderTimeInForceEnum>,
+        quantity: Option<Decimal>,
+        price: Option<Decimal>,
+    }
+
+    impl RecordedOrder {
+        fn from_params(params: NewOrderParams) -> Self {
+            Self {
+                symbol: params.symbol,
+                side: params.side,
+                order_type: params.r#type,
+                time_in_force: params.time_in_force,
+                quantity: params.quantity,
+                price: params.price,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingSpotClient {
+        calls: Mutex<Vec<RecordedOrder>>,
+        responses: Mutex<VecDeque<NewOrderResponse>>,
+    }
+
+    impl RecordingSpotClient {
+        fn new(responses: Vec<NewOrderResponse>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                responses: Mutex::new(responses.into()),
+            }
+        }
+
+        fn take_last(&self) -> RecordedOrder {
+            self.calls
+                .lock()
+                .expect("lock spot client calls")
+                .pop()
+                .expect("expected at least one spot order")
+        }
+    }
+
+    #[async_trait]
+    impl BinanceSpotClient for RecordingSpotClient {
+        async fn new_order(&self, params: NewOrderParams) -> Result<NewOrderResponse> {
+            let record = RecordedOrder::from_params(params);
+            self.calls
+                .lock()
+                .expect("lock recorded orders")
+                .push(record);
+            self.responses
+                .lock()
+                .expect("lock responses")
+                .pop_front()
+                .ok_or_else(|| anyhow!("no prepared new_order response"))
+        }
+
+        async fn delete_order(&self, _params: DeleteOrderParams) -> Result<()> {
+            Err(anyhow!(
+                "delete_order not implemented in RecordingSpotClient"
+            ))
+        }
+
+        async fn delete_open_orders(
+            &self,
+            _params: DeleteOpenOrdersParams,
+        ) -> Result<Vec<DeleteOpenOrdersResponseInner>> {
+            Err(anyhow!(
+                "delete_open_orders not implemented in RecordingSpotClient"
+            ))
+        }
+
+        async fn get_account(&self, _params: GetAccountParams) -> Result<GetAccountResponse> {
+            Err(anyhow!(
+                "get_account not implemented in RecordingSpotClient"
+            ))
+        }
+    }
+
     #[tokio::test]
     async fn withdraw_spot_invokes_wallet_client() {
         let mut executor = BinanceSpotExecutor::new(
@@ -1138,6 +1282,278 @@ mod tests {
             err.to_string().contains("wallet withdraw failed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn place_market_buy_order_uses_expected_params() {
+        let mut response = NewOrderResponse::new();
+        response.symbol = Some("WALUSDC".to_string());
+        response.order_id = Some(42);
+        response.executed_qty = Some("5.00000000".to_string());
+        response.cummulative_quote_qty = Some("15.00000000".to_string());
+
+        let client = Arc::new(RecordingSpotClient::new(vec![response]));
+        let executor = BinanceSpotExecutor {
+            client: client.clone(),
+            wallet_client: Arc::new(RecordingWalletClient::with_id("unused")),
+            recv_window: None,
+            environment: BinanceEnvironment::Testnet,
+        };
+
+        let report = executor
+            .place_order(CexOrderRequest {
+                pair: "WAL/USDC".into(),
+                side: MarketSide::Bid,
+                size: 5.0,
+                price: None,
+                time_in_force: None,
+            })
+            .await
+            .expect("place order");
+
+        assert_eq!(report.order_id, "WALUSDC:42");
+        assert_eq!(report.pair, "WAL/USDC");
+        assert_eq!(report.side, MarketSide::Bid);
+        assert!((report.filled_size - 5.0).abs() < f64::EPSILON);
+        assert!(report.remaining_size.abs() < f64::EPSILON);
+        assert!((report.avg_fill_price - 3.0).abs() < f64::EPSILON);
+        assert_eq!(report.slippage_bps, 0.0);
+
+        let recorded = client.take_last();
+        assert_eq!(recorded.symbol, "WALUSDC");
+        assert!(matches!(recorded.side, NewOrderSideEnum::Buy));
+        assert!(matches!(recorded.order_type, NewOrderTypeEnum::Market));
+        assert!(recorded.time_in_force.is_none());
+        assert!(recorded.price.is_none());
+
+        let quantity = recorded
+            .quantity
+            .expect("market order should set quantity")
+            .to_f64()
+            .expect("decimal to f64");
+        assert!((quantity - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn place_market_sell_order_uses_expected_params() {
+        let mut response = NewOrderResponse::new();
+        response.symbol = Some("WALUSDC".to_string());
+        response.client_order_id = Some("sell-1".to_string());
+        response.executed_qty = Some("2.00000000".to_string());
+        response.cummulative_quote_qty = Some("620.00000000".to_string());
+
+        let client = Arc::new(RecordingSpotClient::new(vec![response]));
+        let executor = BinanceSpotExecutor {
+            client: client.clone(),
+            wallet_client: Arc::new(RecordingWalletClient::with_id("unused")),
+            recv_window: None,
+            environment: BinanceEnvironment::Testnet,
+        };
+
+        let report = executor
+            .place_order(CexOrderRequest {
+                pair: "WAL/USDC".into(),
+                side: MarketSide::Ask,
+                size: 2.0,
+                price: None,
+                time_in_force: None,
+            })
+            .await
+            .expect("place order");
+
+        assert_eq!(report.order_id, "WALUSDC:sell-1");
+        assert_eq!(report.pair, "WAL/USDC");
+        assert_eq!(report.side, MarketSide::Ask);
+        assert!((report.filled_size - 2.0).abs() < f64::EPSILON);
+        assert!(report.remaining_size.abs() < f64::EPSILON);
+        assert!((report.avg_fill_price - 310.0).abs() < f64::EPSILON);
+        assert_eq!(report.slippage_bps, 0.0);
+
+        let recorded = client.take_last();
+        assert_eq!(recorded.symbol, "WALUSDC");
+        assert!(matches!(recorded.side, NewOrderSideEnum::Sell));
+        assert!(matches!(recorded.order_type, NewOrderTypeEnum::Market));
+        assert!(recorded.time_in_force.is_none());
+        assert!(recorded.price.is_none());
+
+        let quantity = recorded
+            .quantity
+            .expect("market order should set quantity")
+            .to_f64()
+            .expect("decimal to f64");
+        assert!((quantity - 2.0).abs() < f64::EPSILON);
+    }
+
+    fn env_flag(key: &str) -> bool {
+        std::env::var(key)
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn env_f64(key: &str) -> Option<f64> {
+        std::env::var(key).ok()?.parse().ok()
+    }
+
+    fn env_u64(key: &str) -> Option<u64> {
+        std::env::var(key).ok()?.parse().ok()
+    }
+
+    fn resolve_secret(env_key: &str) -> Result<String> {
+        let value = std::env::var(env_key).map_err(|_| anyhow!("环境变量 {env_key} 未设置"))?;
+
+        let trimmed = value.trim();
+        ensure!(!trimmed.is_empty(), "环境变量 {env_key} 为空");
+        Ok(trimmed.to_string())
+    }
+
+    fn build_live_executor() -> Result<BinanceSpotExecutor> {
+        let api_key = resolve_secret("BINANCE_API_KEY").context("Binance API Key 未配置")?;
+        let api_secret =
+            resolve_secret("BINANCE_API_SECRET").context("Binance API Secret 未配置")?;
+
+        let environment = if env_flag("BINANCE_USE_TESTNET") {
+            BinanceEnvironment::Testnet
+        } else {
+            BinanceEnvironment::Production
+        };
+
+        let recv_window = env_u64("BINANCE_RECV_WINDOW_MS");
+
+        BinanceSpotExecutor::new(api_key, api_secret, environment, recv_window)
+    }
+
+    #[tokio::test]
+    async fn place_market_buy_order_live() -> Result<()> {
+        let _ = dotenv();
+        if !env_flag("BINANCE_LIVE_TEST") {
+            println!("跳过 place_market_buy_order_live（设置 BINANCE_LIVE_TEST=1 才会真实下单）");
+            return Ok(());
+        }
+
+        let pair = std::env::var("BINANCE_TEST_PAIR").unwrap_or_else(|_| "WAL/USDC".to_string());
+        let size = env_f64("BINANCE_TEST_BUY_SIZE").unwrap_or(5.0);
+
+        let executor = build_live_executor().context("初始化 Binance 执行器失败")?;
+        let report = executor
+            .place_order(CexOrderRequest {
+                pair: pair.clone(),
+                side: MarketSide::Bid,
+                size,
+                price: None,
+                time_in_force: None,
+            })
+            .await
+            .context("place_market_buy_order_live 下单失败")?;
+
+        println!(
+            "买入下单成功: id={}, pair={}, filled={}, price={}",
+            report.order_id, report.pair, report.filled_size, report.avg_fill_price
+        );
+
+        ensure!(report.pair == pair, "返回的交易对与请求不一致");
+        ensure!(
+            report.side == MarketSide::Bid,
+            "返回的方向应为 Bid，但得到 {:?}",
+            report.side
+        );
+        ensure!(report.filled_size > 0.0, "filled_size 应大于 0");
+        ensure!(report.avg_fill_price > 0.0, "avg_fill_price 应大于 0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn place_market_sell_order_live() -> Result<()> {
+        let _ = dotenv();
+        if !env_flag("BINANCE_LIVE_TEST") {
+            println!("跳过 place_market_sell_order_live（设置 BINANCE_LIVE_TEST=1 才会真实下单）");
+            return Ok(());
+        }
+
+        let pair = std::env::var("BINANCE_TEST_PAIR").unwrap_or_else(|_| "WAL/USDC".to_string());
+        let size = env_f64("BINANCE_TEST_SELL_SIZE").unwrap_or(2.0);
+
+        let executor = build_live_executor().context("初始化 Binance 执行器失败")?;
+        let report = executor
+            .place_order(CexOrderRequest {
+                pair: pair.clone(),
+                side: MarketSide::Ask,
+                size,
+                price: None,
+                time_in_force: None,
+            })
+            .await
+            .context("place_market_sell_order_live 下单失败")?;
+
+        println!(
+            "卖出下单成功: id={}, pair={}, filled={}, price={}",
+            report.order_id, report.pair, report.filled_size, report.avg_fill_price
+        );
+
+        ensure!(report.pair == pair, "返回的交易对与请求不一致");
+        ensure!(
+            report.side == MarketSide::Ask,
+            "返回的方向应为 Ask，但得到 {:?}",
+            report.side
+        );
+        ensure!(report.filled_size > 0.0, "filled_size 应大于 0");
+        ensure!(report.avg_fill_price > 0.0, "avg_fill_price 应大于 0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_balances_live_snapshot() -> Result<()> {
+        let _ = dotenv();
+        if !env_flag("BINANCE_LIVE_TEST") {
+            println!(
+                "跳过 fetch_balances_live_snapshot（设置 BINANCE_LIVE_TEST=1 并提供 API 凭证才会真实查询）"
+            );
+            return Ok(());
+        }
+
+        let api_key = std::env::var("BINANCE_API_KEY").unwrap_or_default();
+        let api_secret = std::env::var("BINANCE_API_SECRET").unwrap_or_default();
+        if api_key.trim().is_empty() || api_secret.trim().is_empty() {
+            println!(
+                "跳过 fetch_balances_live_snapshot（未配置 BINANCE_API_KEY / BINANCE_API_SECRET）"
+            );
+            return Ok(());
+        }
+
+        let executor = build_live_executor().context("初始化 Binance 执行器失败")?;
+        let balances = executor
+            .fetch_balances()
+            .await
+            .context("fetch_balances 查询失败")?;
+
+        if balances.is_empty() {
+            println!("账户资产为空");
+        } else {
+            let mut entries: Vec<_> = balances.iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            println!("账户资产列表:");
+            for (symbol, balance) in entries {
+                println!(
+                    "  {} -> free: {}, locked: {}",
+                    symbol, balance.free, balance.locked
+                );
+            }
+        }
+
+        if let Ok(expected) = std::env::var("BINANCE_EXPECT_BALANCE_ASSET") {
+            let symbol = expected.trim().to_uppercase();
+            ensure!(
+                balances.contains_key(&symbol),
+                "账户资产中未找到预期币种 {symbol}"
+            );
+        }
+
+        println!("成功获取 {} 个资产余额", balances.len());
+        Ok(())
     }
 
     #[tokio::test]

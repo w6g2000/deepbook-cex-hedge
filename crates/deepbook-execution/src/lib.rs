@@ -120,6 +120,8 @@ pub trait DeepbookBackend: Send + Sync {
     async fn cancel_all(&self) -> Result<Vec<OrderSnapshot>>;
     async fn record_fill(&self, order_id: &str, fill: FillUpdate) -> Result<OrderSnapshot>;
     async fn claim_fills(&self) -> Result<ClaimSummary>;
+    async fn deposit_into_manager(&self, coin_key: &str, amount: f64) -> Result<()>;
+    async fn withdraw_from_manager(&self, coin_key: &str, amount: f64) -> Result<()>;
     async fn withdraw_settled(&self, pool_key: &str) -> Result<Option<ClaimableBalance>>;
     async fn pool_account_snapshot(&self, pool_key: &str) -> Result<PoolAccountSnapshot>;
     async fn get_order(&self, order_id: &str) -> Result<Option<OrderSnapshot>>;
@@ -172,6 +174,14 @@ impl DeepbookExecution {
 
     pub async fn claim_fills(&self) -> Result<ClaimSummary> {
         self.backend.claim_fills().await
+    }
+
+    pub async fn deposit_into_manager(&self, coin_key: &str, amount: f64) -> Result<()> {
+        self.backend.deposit_into_manager(coin_key, amount).await
+    }
+
+    pub async fn withdraw_from_manager(&self, coin_key: &str, amount: f64) -> Result<()> {
+        self.backend.withdraw_from_manager(coin_key, amount).await
     }
 
     pub async fn withdraw_settled_amounts(
@@ -236,6 +246,7 @@ impl InMemoryBackend {
 struct Inner {
     orders: Mutex<HashMap<OrderId, DeepbookOrder>>,
     claimables: Mutex<HashMap<String, ClaimableBalance>>,
+    balances: Mutex<HashMap<String, f64>>,
     id_counter: std::sync::atomic::AtomicU64,
 }
 
@@ -244,6 +255,7 @@ impl Inner {
         Self {
             orders: Mutex::new(HashMap::new()),
             claimables: Mutex::new(HashMap::new()),
+            balances: Mutex::new(HashMap::new()),
             id_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -393,6 +405,28 @@ impl DeepbookBackend for InMemoryBackend {
         let snapshot = claims.clone();
         claims.clear();
         Ok(ClaimSummary::from_map(snapshot))
+    }
+
+    async fn deposit_into_manager(&self, coin_key: &str, amount: f64) -> Result<()> {
+        ensure!(!coin_key.trim().is_empty(), "coin_key must be provided");
+        ensure!(amount > f64::EPSILON, "deposit amount must be positive");
+        let mut balances = self.inner.balances.lock().await;
+        let entry = balances.entry(coin_key.to_string()).or_insert(0.0);
+        *entry += amount;
+        Ok(())
+    }
+
+    async fn withdraw_from_manager(&self, coin_key: &str, amount: f64) -> Result<()> {
+        ensure!(!coin_key.trim().is_empty(), "coin_key must be provided");
+        ensure!(amount > f64::EPSILON, "withdraw amount must be positive");
+        let mut balances = self.inner.balances.lock().await;
+        let entry = balances.entry(coin_key.to_string()).or_insert(0.0);
+        ensure!(
+            *entry + f64::EPSILON >= amount,
+            "insufficient balance manager funds for {coin_key}"
+        );
+        *entry = (*entry - amount).max(0.0);
+        Ok(())
     }
 
     async fn withdraw_settled(&self, pool_key: &str) -> Result<Option<ClaimableBalance>> {
@@ -579,5 +613,28 @@ mod tests {
         let summary_after = execution.claim_fills().await.expect("claim again");
         assert_eq!(summary_after.total_base, 0.0);
         assert_eq!(summary_after.total_quote, 0.0);
+    }
+
+    #[tokio::test]
+    async fn deposit_and_withdraw_enforces_balance() {
+        let execution = DeepbookExecution::default();
+        execution
+            .deposit_into_manager("USDC", 50.0)
+            .await
+            .expect("initial deposit");
+        execution
+            .withdraw_from_manager("USDC", 20.0)
+            .await
+            .expect("first withdraw");
+
+        let err = execution
+            .withdraw_from_manager("USDC", 40.0)
+            .await
+            .expect_err("insufficient funds must error");
+        assert!(
+            err.to_string()
+                .contains("insufficient balance manager funds"),
+            "unexpected error: {err:?}"
+        );
     }
 }
