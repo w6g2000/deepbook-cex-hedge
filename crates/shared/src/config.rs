@@ -136,9 +136,9 @@ pub struct NaviLendingConfig {
     /// 调用的模块名称，默认 `incentive_v3`。
     #[serde(default = "default_navi_module")]
     pub module: String,
-    /// 调用的函数名称，默认 `entry_deposit`。
-    #[serde(default = "default_navi_function")]
-    pub function: String,
+    /// 存入抵押物时调用的函数名称，默认 `entry_deposit`。
+    #[serde(default = "default_navi_deposit_function", alias = "function")]
+    pub deposit_function: String,
     /// 调用的提现函数名称，默认 `withdraw`。
     #[serde(default = "default_navi_withdraw_function")]
     pub withdraw_function: String,
@@ -212,7 +212,7 @@ fn default_navi_module() -> String {
     "incentive_v3".to_string()
 }
 
-fn default_navi_function() -> String {
+fn default_navi_deposit_function() -> String {
     "entry_deposit".to_string()
 }
 

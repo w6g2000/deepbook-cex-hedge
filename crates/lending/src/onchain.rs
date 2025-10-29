@@ -54,7 +54,7 @@ pub struct NaviOnchainClient {
     sender: SuiAddress,
     package: ObjectID,
     module: Identifier,
-    function: Identifier,
+    deposit_function: Identifier,
     withdraw_function: Identifier,
     borrow_function: Identifier,
     repay_function: Identifier,
@@ -264,8 +264,9 @@ impl NaviOnchainClient {
             .with_context(|| format!("invalid package id {}", package_id))?;
         let module = Identifier::new(config.module.clone())
             .with_context(|| format!("invalid module name {}", config.module))?;
-        let function = Identifier::new(config.function.clone())
-            .with_context(|| format!("invalid function name {}", config.function))?;
+        let deposit_function = Identifier::new(config.deposit_function.clone()).with_context(
+            || format!("invalid function name {}", config.deposit_function),
+        )?;
         let withdraw_function = Identifier::new(config.withdraw_function.clone())
             .with_context(|| format!("invalid function name {}", config.withdraw_function))?;
         let borrow_function = Identifier::new(config.borrow_function.clone())
@@ -351,7 +352,7 @@ impl NaviOnchainClient {
             rpc = %rpc_endpoint,
             coin_type = %config.coin_type,
             module = config.module,
-            function = config.function,
+            deposit_function = config.deposit_function,
             withdraw_function = config.withdraw_function,
             borrow_function = config.borrow_function,
             repay_function = config.repay_function,
@@ -372,7 +373,7 @@ impl NaviOnchainClient {
             sender,
             package,
             module,
-            function,
+            deposit_function,
             withdraw_function,
             borrow_function,
             repay_function,
@@ -1017,7 +1018,7 @@ impl NaviOnchainClient {
         builder.programmable_move_call(
             self.package,
             self.module.clone(),
-            self.function.clone(),
+            self.deposit_function.clone(),
             vec![self.coin_type_tag.clone()],
             vec![
                 clock,

@@ -396,6 +396,60 @@ mod tests {
         drop(rx);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires external network access to Deepbook indexer"]
+    async fn stream_orderbook_snapshots_to_logs() {
+        let _ = tracing_subscriber::fmt().with_target(false).try_init();
+
+        let pair = TradingPair {
+            base: "SUI".to_string(),
+            quote: "USDC".to_string(),
+        };
+
+        let watcher = DeepbookWatcher::new(vec![pair.clone()])
+            .with_poll_interval(Duration::from_millis(500))
+            .with_depth(20)
+            .with_level(2);
+
+        let mut rx = watcher.start();
+        let deadline = Instant::now() + Duration::from_secs(999999999);
+        let mut snapshots = 0usize;
+
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match timeout(remaining.min(Duration::from_secs(2)), rx.recv()).await {
+                Ok(Some(event)) => {
+                    snapshots += 1;
+                    let top_bids = snapshot_levels(&event.bids, 5);
+                    let top_asks = snapshot_levels(&event.asks, 5);
+                    tracing::info!(
+                        pair = %event.pair,
+                        venue = ?event.venue,
+                        bids = ?top_bids,
+                        asks = ?top_asks,
+                        ts_ms = event.ts_ms,
+                        "deepbook realtime orderbook snapshot"
+                    );
+                }
+                Ok(None) => break,
+                Err(_) => tracing::warn!(
+                    "timed out waiting for deepbook snapshot before deadline tick"
+                ),
+            }
+        }
+
+        assert!(
+            snapshots > 0,
+            "expected at least one deepbook snapshot while streaming"
+        );
+
+        drop(rx);
+    }
+
     fn bucket_levels(
         levels: &[OrderBookLevel],
         step: f64,
@@ -428,5 +482,13 @@ mod tests {
         }
 
         aggregated
+    }
+
+    fn snapshot_levels(levels: &[OrderBookLevel], limit: usize) -> Vec<(f64, f64)> {
+        levels
+            .iter()
+            .take(limit)
+            .map(|level| (level.price, level.size))
+            .collect()
     }
 }
